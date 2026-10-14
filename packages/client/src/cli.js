@@ -104,8 +104,15 @@ function printStatus(s, verbose) {
   }
 }
 
+/** Command that opens a URL in the default browser. Not `cmd /c start`: cmd splits URLs at `&`. */
+export function browserCommand(url, platform = process.platform) {
+  if (platform === 'win32') return ['rundll32.exe', ['url.dll,FileProtocolHandler', url]];
+  if (platform === 'darwin') return ['open', [url]];
+  return ['xdg-open', [url]];
+}
+
 function openBrowser(url) {
-  const [cmd, args] = process.platform === 'win32' ? ['cmd', ['/c', 'start', '', url]] : process.platform === 'darwin' ? ['open', [url]] : ['xdg-open', [url]];
+  const [cmd, args] = browserCommand(url);
   try {
     spawn(cmd, args, { stdio: 'ignore', detached: true, windowsHide: true }).unref();
   } catch {

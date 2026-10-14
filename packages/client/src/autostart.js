@@ -15,6 +15,9 @@ const unitFile = () => path.join(process.env.XDG_CONFIG_HOME || path.join(os.hom
 
 /** Starts the daemon in the background, detached from the terminal. */
 export function spawnDaemon() {
+  // The state directory doubles as the daemon's working directory, and a spawn with a
+  // missing cwd fails with a misleading ENOENT, so create it first (fresh installs).
+  fs.mkdirSync(tetherHome(), { recursive: true });
   const child = spawn(process.execPath, [daemonScript, '--home', tetherHome()], {
     detached: true,
     stdio: 'ignore',
@@ -22,6 +25,7 @@ export function spawnDaemon() {
     cwd: tetherHome(), // never hold the caller's folder open
     env: process.env,
   });
+  child.on('error', (e) => console.error(`error: could not start tetherd: ${e.message}`));
   child.unref();
 }
 

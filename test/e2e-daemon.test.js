@@ -1,7 +1,8 @@
 // Phase 7: daemon lifecycle - auto-start from the CLI, start at login (registry / systemd).
 import test, { before, after } from 'node:test';
 import assert from 'node:assert/strict';
-import { spawn } from 'node:child_process';
+import path from 'node:path';
+import { spawn, execFile } from 'node:child_process';
 import { startTestServer } from './helpers/server.js';
 import { Machine, eventually } from './helpers/machine.js';
 import { installedCommand } from '../packages/client/src/autostart.js';
@@ -27,6 +28,19 @@ test('any CLI command starts the daemon when it is not running', async () => {
   const r = await m.run(['login', '--email', 'life@example.com', '--password', 'password123', '--signup']);
   assert.match(r.stdout, /signed in/);
   assert.match((await m.run(['daemon', 'status'])).stdout, /running: pid \d+/);
+});
+
+test('first run: the CLI starts the daemon even when the state folder does not exist yet', async () => {
+  const fresh = path.join(m.home, 'not-created-yet');
+  const env = { ...m.env, TETHER_HOME: fresh };
+  const run = (args) => new Promise((resolve) => {
+    execFile(process.execPath, ['packages/client/bin/tether.js', ...args], { env, timeout: 30000 }, (err, stdout, stderr) => resolve({ code: err ? err.code : 0, stdout, stderr }));
+  });
+  const r = await run(['daemon', 'start']);
+  assert.equal(r.code, 0, r.stderr);
+  assert.match(r.stdout, /tetherd running/);
+  await run(['daemon', 'stop']);
+  await eventually(async () => /not running/.test((await run(['daemon', 'status'])).stdout), { message: 'fresh daemon stopped' });
 });
 
 test('daemon stop and restart', async () => {

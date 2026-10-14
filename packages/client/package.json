@@ -1,0 +1,15 @@
+{
+  "name": "@tether/client",
+  "version": "0.1.0",
+  "type": "module",
+  "bin": {
+    "tether": "bin/tether.js",
+    "tetherd": "bin/tetherd.js"
+  },
+  "dependencies": {
+    "@tether/shared": "^0.1.0",
+    "commander": "^14.0.1",
+    "diff": "^8.0.2",
+    "koffi": "^3.3.3"
+  }
+}

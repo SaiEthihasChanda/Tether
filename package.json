@@ -1,0 +1,21 @@
+{
+  "name": "tether",
+  "private": true,
+  "type": "module",
+  "workspaces": [
+    "packages/*"
+  ],
+  "scripts": {
+    "server": "node packages/server/src/main.js",
+    "console:dev": "npm run dev -w @tether/console",
+    "console:build": "npm run build -w @tether/console",
+    "tether": "node packages/client/bin/tether.js",
+    "test": "node --test --test-concurrency=1 \"test/**/*.test.js\" \"packages/*/test/**/*.test.js\""
+  },
+  "engines": {
+    "node": ">=22.13"
+  },
+  "devDependencies": {
+    "playwright-core": "^1.55.1"
+  }
+}

@@ -1,0 +1,15 @@
+{
+  "name": "@tether/server",
+  "version": "0.1.0",
+  "type": "module",
+  "main": "src/index.js",
+  "bin": {
+    "tether-server": "src/main.js"
+  },
+  "devDependencies": {
+    "mongodb-memory-server": "^10.2.3"
+  },
+  "dependencies": {
+    "@tether/shared": "^0.1.0"
+  }
+}

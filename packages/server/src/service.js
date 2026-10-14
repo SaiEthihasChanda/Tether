@@ -1,0 +1,547 @@
+// All server-side rules live here: roles, version compare-and-set, validation, purges.
+// The HTTP layer only parses requests and calls these methods (DESIGN §3, §6.3, §7, §8.2, §10).
+import path from 'node:path';
+import { newArtifactId, newRepoId, newShareId, nameError, relPathError, caseCollisionError, EOL_MODES, sha256 } from '@tether/shared';
+import { badRequest, forbidden, notFound, conflict, tooLarge } from './errors.js';
+import { publicUser } from './auth/local.js';
+
+/** State of an artifact as clients see it. */
+export function view(a) {
+  return {
+    artifactId: a._id,
+    kind: a.kind,
+    repoId: a.repoId,
+    parentFolderId: a.parentFolderId ?? null,
+    name: a.name,
+    relPath: a.relPath ?? null,
+    version: a.currentVersion,
+    blob: a.blob ?? null,
+    size: a.size ?? 0,
+    deleted: !!a.deleted,
+    eol: a.eol ?? 'auto',
+    exec: !!a.exec,
+  };
+}
+
+/** Sharing settings, visible to the owner only. */
+function sharingView(a) {
+  return { shareId: a.shareId, visibility: a.visibility, editors: a.editors ?? {}, allowlist: a.allowlist ?? [] };
+}
+
+export class TetherService {
+  constructor({ store, blobs, maxFileSize }) {
+    this.store = store;
+    this.blobs = blobs;
+    this.maxFileSize = maxFileSize;
+  }
+
+  // ---- roles ----
+
+  roleOf(uid, root, grant) {
+    if (root.ownerUid === uid) return { role: 'owner', canDelete: true };
+    const ed = root.editors?.[uid];
+    if (ed) return { role: 'editor', canDelete: !!ed.canDelete };
+    if (root.allowlist?.includes(uid)) return { role: 'viewer', canDelete: false };
+    if (root.visibility === 'link' && grant && grant.shareId === root.shareId) return { role: 'viewer', canDelete: false };
+    return { role: null, canDelete: false };
+  }
+
+  /** Loads an artifact and the caller's role on it. Throws 404 if the caller has no access. */
+  async access(uid, artifactId) {
+    const artifact = await this.store.artifactById(artifactId);
+    if (!artifact) throw notFound('artifact not found');
+    const root = artifact.parentFolderId ? await this.store.artifactById(artifact.parentFolderId) : artifact;
+    if (!root) throw notFound('artifact not found');
+    const grant = await this.store.grant(root._id, uid);
+    const r = this.roleOf(uid, root, grant);
+    if (!r.role) throw notFound('artifact not found or access revoked');
+    return { artifact, root, ...r };
+  }
+
+  async requireOwner(uid, artifactId) {
+    const ctx = await this.access(uid, artifactId);
+    if (ctx.role !== 'owner') throw forbidden('only the owner can do this');
+    return ctx;
+  }
+
+  async requireRepoOwner(uid, repoId) {
+    const repo = await this.store.repoById(repoId);
+    if (!repo || repo.ownerUid !== uid) throw notFound('repo not found');
+    return repo;
+  }
+
+  // ---- validation ----
+
+  checkBlob(sha, size) {
+    if (!/^[0-9a-f]{64}$/.test(String(sha))) throw badRequest('invalid blob hash');
+    if (size > this.maxFileSize) throw tooLarge(`file is larger than the ${this.maxFileSize} byte limit`);
+    const actual = this.blobs.size(sha);
+    if (actual === null) throw badRequest(`blob ${sha.slice(0, 12)} has not been uploaded`);
+    return actual;
+  }
+
+  checkEol(eol) {
+    if (eol && !EOL_MODES.includes(eol)) throw badRequest(`eol must be one of ${EOL_MODES.join(', ')}`);
+    return eol || 'auto';
+  }
+
+  checkLayout(relPaths) {
+    for (const p of relPaths) {
+      const e = relPathError(p);
+      if (e) throw badRequest(e);
+    }
+    const e = caseCollisionError(relPaths);
+    if (e) throw badRequest(e);
+  }
+
+  async liveSiblingPaths(folderId, exceptId) {
+    const kids = await this.store.childrenOf(folderId);
+    return kids.filter((k) => !k.deleted && k._id !== exceptId).map((k) => k.relPath);
+  }
+
+  // ---- repos ----
+
+  async createRepo(uid, { name, eolDefaults }) {
+    const e = nameError(String(name || ''));
+    if (e) throw badRequest(`repo name: ${e}`);
+    const repo = { _id: newRepoId(), ownerUid: uid, name, eolDefaults: this.checkRules(eolDefaults), createdAt: new Date() };
+    try {
+      await this.store.createRepo(repo);
+    } catch (err) {
+      if (err.code === 11000) throw conflict(`you already have a repo named "${name}"`);
+      throw err;
+    }
+    return this.repoView(repo);
+  }
+
+  checkRules(rules = {}) {
+    for (const [glob, mode] of Object.entries(rules)) {
+      if (!glob) throw badRequest('empty glob');
+      this.checkEol(mode);
+    }
+    return rules;
+  }
+
+  repoView(repo) {
+    return { repoId: repo._id, name: repo.name, ownerUid: repo.ownerUid, eolDefaults: repo.eolDefaults ?? {}, createdAt: repo.createdAt };
+  }
+
+  async listRepos(uid) {
+    return (await this.store.reposOf(uid)).map((r) => this.repoView(r));
+  }
+
+  async getRepo(uid, repoId) {
+    const repo = await this.requireRepoOwner(uid, repoId);
+    const all = await this.store.artifactsInRepo(repoId);
+    const tops = all.filter((a) => !a.parentFolderId).map((a) => ({
+      ...view(a),
+      ...sharingView(a),
+      fileCount: a.kind === 'folder' ? all.filter((c) => c.parentFolderId === a._id && !c.deleted).length : 1,
+    }));
+    return { ...this.repoView(repo), artifacts: tops };
+  }
+
+  async updateRepo(uid, repoId, { name, eolDefaults }) {
+    await this.requireRepoOwner(uid, repoId);
+    const set = {};
+    if (name !== undefined) {
+      const e = nameError(String(name));
+      if (e) throw badRequest(`repo name: ${e}`);
+      set.name = name;
+    }
+    if (eolDefaults !== undefined) set.eolDefaults = this.checkRules(eolDefaults);
+    try {
+      await this.store.updateRepo(repoId, set);
+    } catch (err) {
+      if (err.code === 11000) throw conflict(`you already have a repo named "${name}"`);
+      throw err;
+    }
+    return this.repoView(await this.store.repoById(repoId));
+  }
+
+  async purgeArtifacts(ids) {
+    if (!ids.length) return;
+    await this.store.deleteVersionsOf(ids);
+    await this.store.deleteGrantsFor(ids);
+    await this.store.deleteArtifacts(ids);
+  }
+
+  /** Hard purge of server data. Client instances become orphaned; local files are never touched. */
+  async deleteRepo(uid, repoId) {
+    await this.requireRepoOwner(uid, repoId);
+    const ids = (await this.store.artifactsInRepo(repoId)).map((a) => a._id);
+    await this.purgeArtifacts(ids);
+    await this.store.deleteRepo(repoId);
+    return { purgedArtifacts: ids.length };
+  }
+
+  /** The new owner takes over; the previous owner stays on as an editor with delete permission. */
+  async transferRepo(uid, repoId, toEmail) {
+    const repo = await this.requireRepoOwner(uid, repoId);
+    const to = await this.store.userByEmail(String(toEmail || '').toLowerCase());
+    if (!to) throw notFound(`no user with email ${toEmail}`);
+    if (to._id === uid) throw badRequest('you already own this repo');
+    const clash = (await this.store.reposOf(to._id)).find((r) => r.name === repo.name);
+    if (clash) throw conflict(`${toEmail} already has a repo named "${repo.name}"`);
+    await this.store.updateRepo(repoId, { ownerUid: to._id });
+    await this.store.updateArtifactsInRepo(repoId, {
+      $set: { ownerUid: to._id, [`editors.${uid}`]: { canDelete: true } },
+      $unset: { [`editors.${to._id}`]: '' },
+    });
+    return this.repoView(await this.store.repoById(repoId));
+  }
+
+  // ---- artifacts ----
+
+  /** `tether manage`: upload a file or folder; the caller becomes the owner. */
+  async manage(uid, { repoId, kind, name, blob, size, eol, exec, files }) {
+    await this.requireRepoOwner(uid, repoId);
+    const e = nameError(String(name || ''));
+    if (e) throw badRequest(e);
+    const now = new Date();
+    const base = { repoId, ownerUid: uid, createdAt: now };
+    const root = {
+      ...base,
+      _id: newArtifactId(),
+      kind,
+      name,
+      parentFolderId: null,
+      relPath: null,
+      currentVersion: 1,
+      deleted: false,
+      shareId: newShareId(),
+      visibility: 'link',
+      editors: {},
+      allowlist: [],
+    };
+    const children = [];
+    if (kind === 'file') {
+      Object.assign(root, { blob, size: this.checkBlob(blob, size), eol: this.checkEol(eol), exec: !!exec });
+    } else if (kind === 'folder') {
+      if (!Array.isArray(files)) throw badRequest('files required for a folder');
+      this.checkLayout(files.map((f) => f.relPath));
+      for (const f of files) {
+        children.push({
+          ...base,
+          _id: newArtifactId(),
+          kind: 'file',
+          parentFolderId: root._id,
+          relPath: f.relPath,
+          name: path.posix.basename(f.relPath),
+          currentVersion: 1,
+          deleted: false,
+          blob: f.blob,
+          size: this.checkBlob(f.blob, f.size),
+          eol: this.checkEol(f.eol),
+          exec: !!f.exec,
+        });
+      }
+    } else throw badRequest('kind must be file or folder');
+    await this.store.insertArtifacts([root, ...children]);
+    for (const a of [root, ...children]) {
+      await this.store.insertVersion({ ...this.snapshot(a), artifactId: a._id, version: 1, type: 'create', authorUid: uid, createdAt: now, basedOn: 0 });
+    }
+    return { artifact: { ...view(root), ...sharingView(root) }, children: children.map(view), role: 'owner', canDelete: true };
+  }
+
+  snapshot(a) {
+    return { blob: a.blob ?? null, size: a.size ?? 0, relPath: a.relPath ?? null, deleted: !!a.deleted };
+  }
+
+  /** `tether add`: owner adds a new file to a folder artifact. */
+  async addChild(uid, folderId, { relPath, blob, size, eol, exec }) {
+    const { artifact: folder } = await this.requireOwner(uid, folderId);
+    if (folder.kind !== 'folder') throw badRequest('not a folder artifact');
+    if (folder.deleted) throw badRequest('folder has been deleted');
+    this.checkLayout([...(await this.liveSiblingPaths(folderId)), relPath]);
+    const now = new Date();
+    const child = {
+      _id: newArtifactId(),
+      repoId: folder.repoId,
+      ownerUid: folder.ownerUid,
+      createdAt: now,
+      kind: 'file',
+      parentFolderId: folderId,
+      relPath,
+      name: path.posix.basename(relPath),
+      currentVersion: 1,
+      deleted: false,
+      blob,
+      size: this.checkBlob(blob, size),
+      eol: this.checkEol(eol),
+      exec: !!exec,
+    };
+    await this.store.insertArtifacts([child]);
+    await this.store.insertVersion({ ...this.snapshot(child), artifactId: child._id, version: 1, type: 'create', authorUid: uid, createdAt: now, basedOn: 0 });
+    await this.bumpFolder(folderId, uid, { type: 'add', childId: child._id, relPath });
+    return view(child);
+  }
+
+  async bumpFolder(folderId, uid, detail) {
+    const version = await this.store.bumpVersion(folderId);
+    await this.store.insertVersion({ artifactId: folderId, version, ...detail, authorUid: uid, createdAt: new Date(), basedOn: version - 1 });
+    return version;
+  }
+
+  /** `tether pull <shareId>`. Records a link grant so rotation can revoke it later. */
+  async pull(uid, shareId) {
+    const root = await this.store.artifactByShareId(String(shareId || '').trim());
+    if (!root) throw notFound('no artifact with that share ID (it may have been rotated)');
+    if (root.deleted) throw notFound('that artifact has been deleted');
+    let r = this.roleOf(uid, root, { shareId: root.shareId });
+    if (!r.role) throw forbidden('this artifact is restricted to an allowlist and you are not on it');
+    if (r.role === 'viewer' && root.visibility === 'link') await this.store.addGrant(root._id, uid, root.shareId);
+    const children = root.kind === 'folder' ? (await this.store.childrenOf(root._id)).filter((c) => !c.deleted).map(view) : [];
+    return { artifact: view(root), children, role: r.role, canDelete: r.canDelete };
+  }
+
+  async getArtifact(uid, artifactId) {
+    const { artifact, root, role, canDelete } = await this.access(uid, artifactId);
+    const out = { artifact: view(artifact), role, canDelete };
+    if (role === 'owner' && !artifact.parentFolderId) Object.assign(out.artifact, sharingView(artifact));
+    if (artifact.kind === 'folder') out.children = (await this.store.childrenOf(artifact._id)).map(view);
+    if (artifact.parentFolderId) out.folder = view(root);
+    return out;
+  }
+
+  /**
+   * One batched call per tick (DESIGN §6.1): items are [{artifactId, version}].
+   * Returns per item: ok | changed (with state) | gone (purged or access revoked), plus the role.
+   */
+  async check(uid, items) {
+    if (!Array.isArray(items)) throw badRequest('items required');
+    const ids = [...new Set(items.map((i) => i.artifactId))];
+    const arts = new Map((await this.store.artifactsByIds(ids)).map((a) => [a._id, a]));
+    const parentIds = [...new Set([...arts.values()].map((a) => a.parentFolderId).filter((p) => p && !arts.has(p)))];
+    for (const p of await this.store.artifactsByIds(parentIds)) arts.set(p._id, p);
+    const rootIds = [...new Set([...arts.values()].map((a) => a.parentFolderId || a._id))];
+    const grants = new Map((await this.store.grantsOf(uid, rootIds)).map((g) => [g.artifactId, g]));
+    const changedFolders = items.filter((i) => arts.get(i.artifactId)?.kind === 'folder' && arts.get(i.artifactId).currentVersion !== i.version).map((i) => i.artifactId);
+    const kids = changedFolders.length ? await this.store.childrenOfMany(changedFolders) : [];
+    return items.map(({ artifactId, version }) => {
+      const a = arts.get(artifactId);
+      if (!a) return { artifactId, status: 'gone', reason: 'purged' };
+      const root = a.parentFolderId ? arts.get(a.parentFolderId) : a;
+      if (!root) return { artifactId, status: 'gone', reason: 'purged' };
+      const { role, canDelete } = this.roleOf(uid, root, grants.get(root._id));
+      if (!role) return { artifactId, status: 'gone', reason: 'revoked' };
+      const out = { artifactId, role, canDelete, version: a.currentVersion, folderDeleted: !!(a.parentFolderId && root.deleted) };
+      if (a.currentVersion === version) return { ...out, status: 'ok' };
+      out.status = 'changed';
+      out.state = view(a);
+      if (a.kind === 'folder') out.children = kids.filter((k) => k.parentFolderId === a._id).map(view);
+      return out;
+    });
+  }
+
+  /**
+   * Push a change from an edit session (DESIGN §6.3). Compare-and-set on the base version:
+   * 409 with the current state if the server has moved on.
+   * change: { blob, size } and/or { relPath } (files in folders) and/or { deleted: true }.
+   */
+  async commit(uid, artifactId, { baseVersion, change = {} }) {
+    const { artifact: a, role, canDelete } = await this.access(uid, artifactId);
+    if (role === 'viewer') throw forbidden('viewers cannot push changes');
+    if (change.deleted && !canDelete) throw forbidden('you do not have delete permission');
+    if (a.deleted) throw conflict('artifact has been deleted', { current: view(a) });
+    if (a.currentVersion !== baseVersion) throw conflict('the artifact changed on the server', { current: view(a) });
+    const set = {};
+    const types = [];
+    if (change.blob !== undefined && change.blob !== a.blob) {
+      if (a.kind !== 'file') throw badRequest('folders have no content');
+      set.blob = change.blob;
+      set.size = this.checkBlob(change.blob, change.size);
+      types.push('content');
+    }
+    if (change.relPath !== undefined && change.relPath !== a.relPath) {
+      if (!a.parentFolderId) throw badRequest('only files inside a folder have a synced path');
+      this.checkLayout([...(await this.liveSiblingPaths(a.parentFolderId, a._id)), change.relPath]);
+      set.relPath = change.relPath;
+      set.name = path.posix.basename(change.relPath);
+      types.push('move');
+    }
+    if (change.deleted) {
+      set.deleted = true;
+      types.push('delete');
+    }
+    if (!types.length) return { version: a.currentVersion, unchanged: true };
+    if (!(await this.store.casArtifact(a._id, baseVersion, set))) {
+      throw conflict('the artifact changed on the server', { current: view(await this.store.artifactById(a._id)) });
+    }
+    const next = { ...a, ...set };
+    await this.store.insertVersion({ ...this.snapshot(next), artifactId: a._id, version: baseVersion + 1, type: types.join('+'), authorUid: uid, createdAt: new Date(), basedOn: baseVersion });
+    if (a.parentFolderId && (set.relPath || set.deleted)) {
+      await this.bumpFolder(a.parentFolderId, uid, { type: set.deleted ? 'delete' : 'move', childId: a._id, relPath: next.relPath });
+    }
+    return { version: baseVersion + 1, state: view({ ...next, currentVersion: baseVersion + 1 }) };
+  }
+
+  /** Forward-only rollback (owner): a new version copies an old version's state. Also restores deletes. */
+  async rollback(uid, artifactId, toVersion) {
+    const { artifact: a } = await this.requireOwner(uid, artifactId);
+    if (a.kind !== 'file') throw badRequest('roll back individual files inside a folder');
+    const v = await this.store.version(a._id, Number(toVersion));
+    if (!v) throw notFound(`version ${toVersion} not found`);
+    const set = { blob: v.blob, size: v.size, deleted: !!v.deleted };
+    if (a.parentFolderId) {
+      set.relPath = v.relPath;
+      set.name = path.posix.basename(v.relPath);
+      if (!set.deleted) this.checkLayout([...(await this.liveSiblingPaths(a.parentFolderId, a._id)), v.relPath]);
+    }
+    if (!(await this.store.casArtifact(a._id, a.currentVersion, set))) throw conflict('the artifact changed while rolling back');
+    const version = a.currentVersion + 1;
+    await this.store.insertVersion({ ...this.snapshot({ ...a, ...set }), artifactId: a._id, version, type: a.deleted && !set.deleted ? 'restore' : 'rollback', rolledBackTo: v.version, authorUid: uid, createdAt: new Date(), basedOn: a.currentVersion });
+    if (a.parentFolderId && (set.relPath !== a.relPath || set.deleted !== !!a.deleted)) {
+      await this.bumpFolder(a.parentFolderId, uid, { type: set.deleted ? 'delete' : 'restore', childId: a._id, relPath: set.relPath });
+    }
+    return view({ ...a, ...set, currentVersion: version });
+  }
+
+  /** Soft-delete for everyone (owner, or editor with delete permission). */
+  async deleteArtifact(uid, artifactId) {
+    const { artifact: a, canDelete } = await this.access(uid, artifactId);
+    if (!canDelete) throw forbidden('you do not have delete permission');
+    if (a.deleted) return view(a);
+    if (a.kind === 'folder') {
+      await this.store.casArtifact(a._id, a.currentVersion, { deleted: true });
+      await this.store.insertVersion({ artifactId: a._id, version: a.currentVersion + 1, type: 'delete', deleted: true, authorUid: uid, createdAt: new Date(), basedOn: a.currentVersion });
+      return view({ ...a, deleted: true, currentVersion: a.currentVersion + 1 });
+    }
+    return (await this.commit(uid, artifactId, { baseVersion: a.currentVersion, change: { deleted: true } })).state;
+  }
+
+  /** Restore a soft-deleted folder (owner). Files are restored with rollback. */
+  async restoreFolder(uid, artifactId) {
+    const { artifact: a } = await this.requireOwner(uid, artifactId);
+    if (a.kind !== 'folder' || !a.deleted) throw badRequest('not a deleted folder');
+    await this.store.casArtifact(a._id, a.currentVersion, { deleted: false });
+    await this.store.insertVersion({ artifactId: a._id, version: a.currentVersion + 1, type: 'restore', deleted: false, authorUid: uid, createdAt: new Date(), basedOn: a.currentVersion });
+    return view({ ...a, deleted: false, currentVersion: a.currentVersion + 1 });
+  }
+
+  async history(uid, artifactId) {
+    await this.access(uid, artifactId);
+    const versions = await this.store.versionsOf(artifactId);
+    const users = new Map((await this.store.usersByIds([...new Set(versions.map((v) => v.authorUid))])).map((u) => [u._id, u]));
+    return versions.map(({ _id, artifactId: _, ...v }) => ({ ...v, author: users.get(v.authorUid)?.email ?? '(deleted user)' }));
+  }
+
+  // ---- sharing ----
+
+  async resolveUser(email) {
+    const u = await this.store.userByEmail(String(email || '').trim().toLowerCase());
+    if (!u) throw notFound(`no Tether user with email ${email}`);
+    return u;
+  }
+
+  /**
+   * Owner-only sharing changes. op is one of:
+   * { addEditor: email, canDelete } | { revoke: email } | { visibility, allow: [email] } | { rotate: true }
+   */
+  async share(uid, artifactId, op) {
+    const { artifact: a } = await this.requireOwner(uid, artifactId);
+    if (a.parentFolderId) throw badRequest('share the folder, not a file inside it');
+    const update = { $set: {}, $unset: {} };
+    if (op.addEditor) {
+      const u = await this.resolveUser(op.addEditor);
+      if (u._id === uid) throw badRequest('you are the owner');
+      update.$set[`editors.${u._id}`] = { canDelete: !!op.canDelete };
+    } else if (op.revoke) {
+      const u = await this.resolveUser(op.revoke);
+      update.$unset[`editors.${u._id}`] = '';
+      update.$set.allowlist = (a.allowlist ?? []).filter((x) => x !== u._id);
+      await this.store.deleteGrant(a._id, u._id);
+    } else if (op.demote) {
+      const u = await this.resolveUser(op.demote);
+      if (!a.editors?.[u._id]) throw badRequest(`${op.demote} is not an editor`);
+      update.$unset[`editors.${u._id}`] = '';
+      update.$set.allowlist = [...new Set([...(a.allowlist ?? []), u._id])];
+    } else if (op.visibility) {
+      if (!['link', 'allowlist'].includes(op.visibility)) throw badRequest('visibility must be link or allowlist');
+      update.$set.visibility = op.visibility;
+      if (op.allow) update.$set.allowlist = [...new Set([...(a.allowlist ?? []), ...(await Promise.all(op.allow.map((e) => this.resolveUser(e)))).map((u) => u._id)])];
+    } else if (op.allow) {
+      update.$set.allowlist = [...new Set([...(a.allowlist ?? []), ...(await Promise.all(op.allow.map((e) => this.resolveUser(e)))).map((u) => u._id)])];
+    } else if (op.rotate) {
+      update.$set.shareId = newShareId();
+    } else throw badRequest('unknown share operation');
+    if (!Object.keys(update.$unset).length) delete update.$unset;
+    if (!Object.keys(update.$set).length) delete update.$set;
+    await this.store.updateArtifact(a._id, update);
+    return this.sharing(uid, artifactId);
+  }
+
+  async sharing(uid, artifactId) {
+    const { artifact: a } = await this.requireOwner(uid, artifactId);
+    const ids = [...Object.keys(a.editors ?? {}), ...(a.allowlist ?? [])];
+    const users = new Map((await this.store.usersByIds(ids)).map((u) => [u._id, u]));
+    const label = (id) => users.get(id)?.email ?? id;
+    return {
+      shareId: a.shareId,
+      visibility: a.visibility,
+      editors: Object.entries(a.editors ?? {}).map(([id, e]) => ({ uid: id, email: label(id), canDelete: !!e.canDelete })),
+      allowlist: (a.allowlist ?? []).map((id) => ({ uid: id, email: label(id) })),
+    };
+  }
+
+  /** Artifacts other people shared with the caller as an editor or by allowlist. */
+  async sharedWithMe(uid) {
+    return (await this.store.artifactsWhereMember(uid)).map((a) => ({ ...view(a), role: a.editors?.[uid] ? 'editor' : 'viewer' }));
+  }
+
+  // ---- blobs ----
+
+  async blobsToUpload(blobs) {
+    const out = [];
+    for (const { sha256: sha, size } of blobs ?? []) {
+      if (!/^[0-9a-f]{64}$/.test(String(sha))) throw badRequest('invalid blob hash');
+      if (size > this.maxFileSize) throw tooLarge(`file is larger than the ${this.maxFileSize} byte limit`);
+      if (!this.blobs.has(sha)) out.push({ sha256: sha, url: this.blobs.signedUrl('put', sha, size) });
+    }
+    return out;
+  }
+
+  async receiveBlob(sha, query, bytes) {
+    if (!this.blobs.verify('put', sha, query)) throw forbidden('upload URL invalid or expired');
+    if (bytes.length > this.maxFileSize) throw tooLarge('file too large');
+    if (bytes.length !== Number(query.size)) throw badRequest('size does not match');
+    if (sha256(bytes) !== sha) throw badRequest('content does not match its hash');
+    await this.blobs.put(sha, bytes);
+  }
+
+  /** Signed download URLs for (artifactId, version?) pairs the caller can read. */
+  async downloadUrls(uid, items) {
+    const out = [];
+    for (const { artifactId, version } of items ?? []) {
+      const { artifact: a } = await this.access(uid, artifactId);
+      let sha = a.blob;
+      if (version !== undefined && version !== a.currentVersion) {
+        const v = await this.store.version(a._id, Number(version));
+        if (!v) throw notFound(`version ${version} not found`);
+        sha = v.blob;
+      }
+      if (!sha) throw badRequest('nothing to download');
+      out.push({ artifactId, version: version ?? a.currentVersion, sha256: sha, url: this.blobs.signedUrl('get', sha) });
+    }
+    return out;
+  }
+
+  // ---- account ----
+
+  async me(uid) {
+    const u = await this.store.userById(uid);
+    if (!u) throw notFound('account not found');
+    return publicUser(u);
+  }
+
+  /** Account deletion: purge owned repos (server only) and remove the user from others' sharing. */
+  async deleteAccount(uid) {
+    for (const repo of await this.store.reposOf(uid)) await this.deleteRepo(uid, repo._id);
+    for (const a of await this.store.artifactsWhereMember(uid)) {
+      await this.store.updateArtifact(a._id, { $unset: { [`editors.${uid}`]: '' }, $pull: { allowlist: uid } });
+    }
+    await this.store.deleteGrantsOfUser(uid);
+    await this.store.deleteSessionsOf(uid);
+    await this.store.deleteUser(uid);
+  }
+}

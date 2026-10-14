@@ -2,7 +2,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 
 export const DEFAULTS = {
-  server: 'http://127.0.0.1:8787',
+  server: 'https://tether-b10cf.web.app',
   consoleUrl: '', // defaults to the server URL
   tickSeconds: 30,
   graceMs: 2000,

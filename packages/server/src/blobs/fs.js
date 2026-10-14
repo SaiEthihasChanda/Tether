@@ -46,6 +46,14 @@ export class FsBlobStore {
     return crypto.createHmac('sha256', this.secret).update(`${op}|${sha}|${size}|${exp}`).digest('base64url');
   }
 
+  async uploadTarget(sha, size) {
+    return { url: this.signedUrl('put', sha, size), headers: {} };
+  }
+
+  async downloadUrl(sha) {
+    return this.signedUrl('get', sha);
+  }
+
   signedUrl(op, sha, size = 0) {
     const exp = Math.floor(Date.now() / 1000) + this.ttl;
     const sig = this.sign(op, sha, size, exp);

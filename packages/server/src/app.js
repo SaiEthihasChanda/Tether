@@ -9,18 +9,21 @@ export function createApp({ service, auth, consoleDir, maxFileSize }) {
   const app = express();
   app.disable('x-powered-by');
 
-  // Blob transfer endpoints, authorized by signed URL rather than by user token.
-  app.put('/blobs/:sha', express.raw({ type: () => true, limit: maxFileSize + 1024 }), async (req, res) => {
+  // Blob transfer endpoints for the local blob store (Cloud Storage serves its own signed URLs).
+  if (service.blobs.receive !== false) app.put('/blobs/:sha', express.raw({ type: () => true, limit: maxFileSize + 1024 }), async (req, res) => {
     await service.receiveBlob(req.params.sha, req.query, Buffer.isBuffer(req.body) ? req.body : Buffer.alloc(0));
     res.status(204).end();
   });
-  app.get('/blobs/:sha', async (req, res) => {
+  if (service.blobs.receive !== false) app.get('/blobs/:sha', async (req, res) => {
     if (!service.blobs.verify('get', req.params.sha, req.query)) throw new HttpError(403, 'forbidden', 'download URL invalid or expired');
     res.type('application/octet-stream').send(await service.blobs.read(req.params.sha));
   });
 
   const api = express.Router();
   api.use(express.json({ limit: '5mb' }));
+
+  // public client configuration: which auth system to use
+  api.get('/config', (_req, res) => res.json({ ...auth.publicConfig(), maxFileSize }));
 
   // auth
   api.post('/auth/signup', async (req, res) => res.json(await auth.signup(req.body)));
@@ -33,9 +36,9 @@ export function createApp({ service, auth, consoleDir, maxFileSize }) {
   api.post('/auth/cli-exchange', async (req, res) => res.json(await auth.exchangeCliCode(req.body.code)));
 
   // everything below requires a signed-in user
-  api.use((req, _res, next) => {
+  api.use(async (req, _res, next) => {
     const h = req.get('authorization') || '';
-    req.uid = auth.verify(h.startsWith('Bearer ') ? h.slice(7) : '');
+    req.uid = await auth.verify(h.startsWith('Bearer ') ? h.slice(7) : '');
     next();
   });
 
@@ -43,6 +46,7 @@ export function createApp({ service, auth, consoleDir, maxFileSize }) {
   api.get('/me', async (req, res) => res.json(await service.me(req.uid)));
   api.delete('/me', async (req, res) => {
     await service.deleteAccount(req.uid);
+    await auth.deleteUser?.(req.uid);
     res.json({ ok: true });
   });
   api.get('/shared', async (req, res) => res.json(await service.sharedWithMe(req.uid)));

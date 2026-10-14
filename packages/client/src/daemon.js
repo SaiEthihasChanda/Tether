@@ -121,8 +121,7 @@ export async function runDaemon() {
       if (u.pathname !== '/callback') return res.writeHead(404).end();
       if (u.searchParams.get('state') !== state) return res.writeHead(400).end('state mismatch');
       try {
-        const tokens = await api.raw('POST', '/auth/cli-exchange', { code: u.searchParams.get('code') });
-        const user = await api.signedIn(tokens);
+        const user = await api.exchangeCliCode(u.searchParams.get('code'));
         res.writeHead(200, { 'content-type': 'text/html' }).end('<!doctype html><title>Tether</title><body style="font-family:sans-serif;padding:2rem"><h2>Tether CLI signed in</h2><p>You can close this tab.</p>');
         settle.resolve(user);
       } catch (e) {
@@ -157,8 +156,7 @@ export async function runDaemon() {
       return { offline: engine.offline };
     },
     async 'login.password'({ email, password, signup }) {
-      const tokens = await api.raw('POST', signup ? '/auth/signup' : '/auth/login', { email, password });
-      const user = await api.signedIn(tokens);
+      const user = await api.passwordLogin({ email, password, signup });
       soon();
       return user;
     },

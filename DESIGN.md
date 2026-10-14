@@ -331,10 +331,13 @@ The first build follows this document with these substitutions:
 - **Client in Node.js, not Rust.**
   - Win32 is called through `koffi`; the local map uses `node:sqlite`.
   - The daemon IPC is a named pipe or Unix socket, as designed.
-- **Local backend instead of Firebase**, each part behind an adapter:
-  - MongoDB for metadata.
-  - Filesystem blobs with HMAC-signed URLs.
-  - Email/password auth.
+- **Firebase in production (2026-10-14):**
+  - Firestore for metadata.
+  - Cloud Storage for content.
+  - Firebase Auth for sign-in.
+  - The API runs as one Cloud Function (`api`, asia-south1) behind Hosting rewrites.
+- **Local backend kept for development and tests:** MongoDB, filesystem blobs, local auth.
+- **Cloud Storage does not check sha256**, so upload URLs are create-only and a blob is downloaded and hashed the first time an artifact references it. A mismatching blob is deleted.
 - **Linux runs the no-root scan tracker.** The `fanotify` helper is deferred.
 
 The build answered the open questions below as follows. Each is easy to change.

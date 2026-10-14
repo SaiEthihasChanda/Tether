@@ -121,6 +121,11 @@ function openBrowser(url) {
 }
 
 export async function main(argv) {
+  // `tether status | head` closes stdout early; that is not an error.
+  process.stdout.on('error', (e) => {
+    if (e.code === 'EPIPE') process.exit(0);
+    throw e;
+  });
   const program = new Command('tether').description('Keep files in sync with a central source of truth, wherever they live.').version('0.1.0');
   program.showHelpAfterError();
 

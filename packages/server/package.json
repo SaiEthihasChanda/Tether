@@ -10,6 +10,7 @@
     "mongodb-memory-server": "^10.2.3"
   },
   "dependencies": {
-    "@tether/shared": "^0.1.0"
+    "@tether/shared": "^0.1.0",
+    "firebase-admin": "^14.5.0"
   }
 }

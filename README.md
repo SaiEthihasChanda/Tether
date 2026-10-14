@@ -15,22 +15,25 @@ test/       end-to-end tests: real server, real daemons, real files, real browse
 
 - Node.js 22.13 or newer (24 recommended).
 - Windows 10/11 on NTFS or ReFS, or Linux.
-- Nothing else to install. The dev server downloads and runs its own MongoDB the first time it starts.
 
-## Run it locally
+## Use the hosted service
+
+Production runs on Firebase (project `tether-b10cf`):
+
+| | |
+|---|---|
+| Web console | https://tether-b10cf.web.app |
+| API | Cloud Function `api` in asia-south1, reached through Hosting at `/v1/**` |
+| Metadata | Firestore |
+| File content | Cloud Storage |
+| Sign-in | Firebase Auth (email and password) |
+
+The CLI uses the hosted service by default:
 
 ```sh
 npm install
-npm run console:build      # build the web console (served by the server)
-npm run server             # http://127.0.0.1:8787; data in ./.tether-dev/server
-```
-
-To use an existing MongoDB instead of the embedded one, set `TETHER_MONGO_URL=mongodb://...`. Other settings are `TETHER_PORT`, `TETHER_DATA_DIR`, and `TETHER_MAX_FILE_SIZE` (bytes; the default is 10 MB).
-
-To use the CLI, run `npm link -w @tether/client` so `tether` is on your PATH, or use `npm run tether -- <args>`:
-
-```sh
-tether login                         # opens the console; or: tether login --email you@x.com --password ... --signup
+npm link -w @tether/client           # puts `tether` on your PATH
+tether login                         # browser sign-in; or: tether login --email you@x.com --password ... [--signup]
 tether repo create team
 tether manage .editorconfig --repo team     # prints a share ID
 tether pull abcd-efgh-jkmn                  # on another machine or account
@@ -40,36 +43,55 @@ tether share .editorconfig --editor friend@example.com
 tether daemon install        # start tetherd at login
 ```
 
-The CLI starts the daemon automatically when needed. Run `tether --help` to see every command.
+The CLI starts the background daemon automatically when needed. Run `tether --help` to see every command.
 
-The console is at http://127.0.0.1:8787. For live reload, run `npm run console:dev` (http://127.0.0.1:5173, with the API proxied to :8787).
+## Deploy
+
+```sh
+npm run deploy      # builds the console and the functions bundle, then deploys functions, hosting and rules
+```
+
+This needs `firebase login` with access to the project. The function's service account needs `roles/iam.serviceAccountTokenCreator` on itself, which is already granted, so it can sign Storage URLs and custom login tokens.
+
+## Run everything locally (development)
+
+```sh
+npm run console:build
+npm run server                                  # http://127.0.0.1:8787, embedded MongoDB, local auth
+tether config set server http://127.0.0.1:8787  # point the CLI at it
+```
+
+Local server settings are `TETHER_MONGO_URL`, `TETHER_PORT`, `TETHER_DATA_DIR`, and `TETHER_MAX_FILE_SIZE` (default 10 MB). For live reload, run `npm run console:dev` (port 5173, with the API proxied to :8787).
 
 ## Tests
 
 ```sh
-npm test            # 75 tests, about 90 s
+npm test                 # 77 tests on the local backend (in-memory MongoDB), about 90 s
+npm run test:firebase    # the same 77 tests on Firestore + Firebase Auth emulators (needs Java)
+node test/prod-smoke.mjs            # two real clients against production (temporary accounts, deleted afterwards)
+node test/prod-console-smoke.mjs    # console + browser login against production
 ```
 
-- The server tests start an in-memory MongoDB.
 - The end-to-end tests run several isolated clients (`TETHER_HOME` per simulated machine) against one server.
-- The console tests drive the installed Edge or Chrome through `playwright-core`, and are skipped if neither is found.
+- The console tests drive the installed Edge or Chrome through `playwright-core`.
 - The start-at-login test writes a `TetherTest` value under `HKCU\...\Run` and removes it again.
 
-## Moving to Firebase later
+## Backends
 
-The server keeps storage, blobs and auth behind small adapters, so each can be replaced on its own:
+The server has two backends. Both use the same rules in `service.js`.
 
-| Local (now) | Firebase (later) | Where |
+| Part | `local` (dev, tests) | `firebase` (production) |
 |---|---|---|
-| `MongoStore` | Firestore (Admin SDK) | `packages/server/src/store/mongo.js` |
-| `FsBlobStore` + HMAC-signed URLs | Cloud Storage signed URLs | `packages/server/src/blobs/fs.js` |
-| `LocalAuth` (email + password) | Firebase Auth ID tokens | `packages/server/src/auth/local.js` |
-| Express app | Cloud Functions (`onRequest`) | `packages/server/src/app.js` |
+| Metadata | `store/mongo.js` (MongoDB) | `store/firestore.js` (Firestore; compare-and-set via transactions) |
+| Content | `blobs/fs.js` (HMAC-signed URLs) | `blobs/gcs.js` (Cloud Storage v4 signed URLs: create-only, size-capped; sha256 verified on first use) |
+| Sign-in | `auth/local.js` (email + password) | `auth/firebase.js` (ID tokens; custom tokens for the CLI browser login) |
+| Runs as | `npm run server` | Cloud Function (`src/functions.js`, bundled to `firebase/functions/lib`) |
 
-All rules live in `service.js`, and that file doesn't change. Version checks are compare-and-set on `currentVersion`, which maps to a Firestore transaction.
+Firestore and Storage security rules deny all direct client access: every read and write goes through the API.
 
 ## Not done yet
 
 - **Linux:** the `fanotify` root helper is not built (the trial is deferred). Linux uses the no-root scan tracker, which is tested on Windows via `TETHER_TRACKER=scan` but not yet on a Linux kernel.
 - **Linux credentials** are stored in a file with mode 0600, not yet in Secret Service. Windows uses DPAPI.
-- **Deferred in DESIGN §12:** polling cost, push notifications, delta sync, history retention, and blob garbage collection.
+- **Deferred in DESIGN §12:** polling cost, push notifications, delta sync, history retention, and blob garbage collection. Each client calls the function once per tick (30 s by default). That is fine at small scale; watch the Cloud Functions bill as usage grows.
+- The console doesn't load Google Analytics, even though the Firebase snippet includes it.

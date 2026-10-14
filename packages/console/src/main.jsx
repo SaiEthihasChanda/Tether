@@ -81,7 +81,19 @@ function SignIn({ onUser, note }) {
   const [email, setEmail] = useState('');
   const [password, setPassword] = useState('');
   const [error, setError] = useState(null);
+  const [notice, setNotice] = useState(null);
   const [busy, setBusy] = useState(false);
+  async function reset() {
+    setError(null);
+    setNotice(null);
+    if (!email) return setError(new Error('Enter your email first.'));
+    try {
+      await A.resetPassword(email);
+      setNotice(`If ${email} has an account, a reset link is on its way.`);
+    } catch (err) {
+      setError(err);
+    }
+  }
   async function submit(e) {
     e.preventDefault();
     setBusy(true);
@@ -100,10 +112,12 @@ function SignIn({ onUser, note }) {
       {note && <p className="muted">{note}</p>}
       <form onSubmit={submit}>
         <label>Email<input type="email" autoComplete="email" value={email} onChange={(e) => setEmail(e.target.value)} required /></label>
-        <label>Password<input type="password" autoComplete={mode === 'login' ? 'current-password' : 'new-password'} minLength={8} value={password} onChange={(e) => setPassword(e.target.value)} required /></label>
+        <label>Password<input type="password" autoComplete={mode === 'login' ? 'current-password' : 'new-password'} minLength={A.isFirebase() ? 6 : 8} value={password} onChange={(e) => setPassword(e.target.value)} required /></label>
         <ErrorNote error={error} />
+        {notice && <p className="muted" role="status">{notice}</p>}
         <button type="submit" disabled={busy}>{busy ? '…' : mode === 'login' ? 'Sign in' : 'Create account'}</button>
       </form>
+      {mode === 'login' && A.isFirebase() && <p className="muted switch"><button className="link" onClick={reset}>Forgot password?</button></p>}
       <p className="muted switch">
         {mode === 'login' ? 'New here? ' : 'Have an account? '}
         <button className="link" onClick={() => setMode(mode === 'login' ? 'signup' : 'login')}>{mode === 'login' ? 'Create an account' : 'Sign in'}</button>

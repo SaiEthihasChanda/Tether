@@ -72,10 +72,10 @@ export class TetherService {
 
   // ---- validation ----
 
-  checkBlob(sha, size) {
+  async checkBlob(sha, size) {
     if (!/^[0-9a-f]{64}$/.test(String(sha))) throw badRequest('invalid blob hash');
     if (size > this.maxFileSize) throw tooLarge(`file is larger than the ${this.maxFileSize} byte limit`);
-    const actual = this.blobs.size(sha);
+    const actual = await this.blobs.size(sha);
     if (actual === null) throw badRequest(`blob ${sha.slice(0, 12)} has not been uploaded`);
     return actual;
   }
@@ -216,7 +216,7 @@ export class TetherService {
     };
     const children = [];
     if (kind === 'file') {
-      Object.assign(root, { blob, size: this.checkBlob(blob, size), eol: this.checkEol(eol), exec: !!exec });
+      Object.assign(root, { blob, size: await this.checkBlob(blob, size), eol: this.checkEol(eol), exec: !!exec });
     } else if (kind === 'folder') {
       if (!Array.isArray(files)) throw badRequest('files required for a folder');
       this.checkLayout(files.map((f) => f.relPath));
@@ -231,7 +231,7 @@ export class TetherService {
           currentVersion: 1,
           deleted: false,
           blob: f.blob,
-          size: this.checkBlob(f.blob, f.size),
+          size: await this.checkBlob(f.blob, f.size),
           eol: this.checkEol(f.eol),
           exec: !!f.exec,
         });
@@ -267,7 +267,7 @@ export class TetherService {
       currentVersion: 1,
       deleted: false,
       blob,
-      size: this.checkBlob(blob, size),
+      size: await this.checkBlob(blob, size),
       eol: this.checkEol(eol),
       exec: !!exec,
     };
@@ -350,7 +350,7 @@ export class TetherService {
     if (change.blob !== undefined && change.blob !== a.blob) {
       if (a.kind !== 'file') throw badRequest('folders have no content');
       set.blob = change.blob;
-      set.size = this.checkBlob(change.blob, change.size);
+      set.size = await this.checkBlob(change.blob, change.size);
       types.push('content');
     }
     if (change.relPath !== undefined && change.relPath !== a.relPath) {
@@ -496,7 +496,7 @@ export class TetherService {
     for (const { sha256: sha, size } of blobs ?? []) {
       if (!/^[0-9a-f]{64}$/.test(String(sha))) throw badRequest('invalid blob hash');
       if (size > this.maxFileSize) throw tooLarge(`file is larger than the ${this.maxFileSize} byte limit`);
-      if (!this.blobs.has(sha)) out.push({ sha256: sha, url: this.blobs.signedUrl('put', sha, size) });
+      if (!(await this.blobs.has(sha))) out.push({ sha256: sha, ...(await this.blobs.uploadTarget(sha, size)) });
     }
     return out;
   }
@@ -521,7 +521,7 @@ export class TetherService {
         sha = v.blob;
       }
       if (!sha) throw badRequest('nothing to download');
-      out.push({ artifactId, version: version ?? a.currentVersion, sha256: sha, url: this.blobs.signedUrl('get', sha) });
+      out.push({ artifactId, version: version ?? a.currentVersion, sha256: sha, url: await this.blobs.downloadUrl(sha) });
     }
     return out;
   }

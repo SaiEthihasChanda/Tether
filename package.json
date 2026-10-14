@@ -10,12 +10,18 @@
     "console:dev": "npm run dev -w @tether/console",
     "console:build": "npm run build -w @tether/console",
     "tether": "node packages/client/bin/tether.js",
-    "test": "node --test --test-concurrency=1 \"test/**/*.test.js\" \"packages/*/test/**/*.test.js\""
+    "test": "node --test --test-concurrency=1 \"test/**/*.test.js\" \"packages/*/test/**/*.test.js\"",
+    "build:functions": "esbuild packages/server/src/functions.js --bundle --platform=node --target=node22 --format=cjs --outfile=firebase/functions/lib/index.js --external:firebase-admin --external:firebase-functions --external:mongodb --log-level=warning",
+    "test:firebase": "firebase emulators:exec --only auth,firestore --project demo-tether \"npm test\"",
+    "deploy": "firebase deploy --only functions,hosting,firestore:rules,storage",
+    "build:cli": "node packages/client/npm/build.mjs"
   },
   "engines": {
     "node": ">=22.13"
   },
   "devDependencies": {
+    "esbuild": "^0.28.2",
+    "firebase-functions": "^7.4.0",
     "playwright-core": "^1.55.1"
   }
 }

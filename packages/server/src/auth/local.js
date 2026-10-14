@@ -26,6 +26,10 @@ export class LocalAuth {
     this.secret = secret;
   }
 
+  publicConfig() {
+    return { auth: 'local' };
+  }
+
   sign(payload) {
     return crypto.createHmac('sha256', this.secret).update(payload).digest('base64url');
   }

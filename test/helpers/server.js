@@ -4,17 +4,42 @@ import os from 'node:os';
 import path from 'node:path';
 import { MongoMemoryServer } from 'mongodb-memory-server';
 import { startServer } from '../../packages/server/src/index.js';
+import { FsBlobStore } from '../../packages/server/src/blobs/fs.js';
 import { sha256 } from '../../packages/shared/src/index.js';
 
+/**
+ * Backend under test: "firebase" when the Firebase emulators are running
+ * (`npm run test:firebase`), otherwise local MongoDB.
+ */
+export const FIREBASE = !!process.env.FIRESTORE_EMULATOR_HOST;
+const PROJECT = process.env.GCLOUD_PROJECT || 'demo-tether';
+export const API_KEY = 'demo-key';
+
+async function clearEmulators() {
+  const fsHost = process.env.FIRESTORE_EMULATOR_HOST;
+  const authHost = process.env.FIREBASE_AUTH_EMULATOR_HOST;
+  await fetch(`http://${fsHost}/emulator/v1/projects/${PROJECT}/databases/(default)/documents`, { method: 'DELETE' });
+  await fetch(`http://${authHost}/emulator/v1/projects/${PROJECT}/accounts`, { method: 'DELETE' });
+}
+
 export async function startTestServer(opts = {}) {
-  const mongo = await MongoMemoryServer.create();
   const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'tether-srv-'));
-  const server = await startServer({ port: 0, mongoUrl: mongo.getUri(), dbName: 'test', dataDir, consoleDir: null, ...opts });
+  let mongo = null;
+  let backendOpts;
+  if (FIREBASE) {
+    await clearEmulators();
+    const blobs = new FsBlobStore(path.join(dataDir, 'blobs'), { secret: 'test-secret', publicUrl: '' });
+    backendOpts = { backend: 'firebase', firebase: { projectId: PROJECT, apiKey: API_KEY, authDomain: '', blobs } };
+  } else {
+    mongo = await MongoMemoryServer.create();
+    backendOpts = { mongoUrl: mongo.getUri(), dbName: 'test' };
+  }
+  const server = await startServer({ port: 0, dataDir, consoleDir: null, ...backendOpts, ...opts });
   return {
     ...server,
     async stop() {
       await server.close();
-      await mongo.stop();
+      await mongo?.stop();
       fs.rmSync(dataDir, { recursive: true, force: true });
     },
   };
@@ -27,11 +52,24 @@ export class TestUser {
   }
 
   async signup(email, password = 'password123') {
+    this.email = email;
+    if (FIREBASE) {
+      const res = await fetch(`http://${process.env.FIREBASE_AUTH_EMULATOR_HOST}/identitytoolkit.googleapis.com/v1/accounts:signUp?key=${API_KEY}`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ email, password, returnSecureToken: true }),
+      });
+      const r = await res.json();
+      if (!res.ok) throw new Error(r.error?.message);
+      this.token = r.idToken;
+      this.uid = r.localId;
+      await this.call('GET', '/me');
+      return this;
+    }
     const r = await this.call('POST', '/auth/signup', { email, password });
     this.token = r.accessToken;
     this.refreshToken = r.refreshToken;
     this.uid = r.user.uid;
-    this.email = email;
     return this;
   }
 

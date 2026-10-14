@@ -1,6 +1,6 @@
 import test, { before, after } from 'node:test';
 import assert from 'node:assert/strict';
-import { startTestServer, TestUser, rejects } from './helpers/server.js';
+import { startTestServer, TestUser, rejects, FIREBASE } from './helpers/server.js';
 
 let srv, owner, editor, viewer, stranger, repo;
 
@@ -20,11 +20,20 @@ async function manageFile(name, text) {
 }
 
 test('auth: wrong password, refresh, unauthenticated calls', async () => {
-  await rejects(new TestUser(srv.url).call('POST', '/auth/login', { email: 'owner@example.com', password: 'nope' }), 401);
   await rejects(new TestUser(srv.url).call('GET', '/repos'), 401);
+  const bad = new TestUser(srv.url);
+  bad.token = 'not-a-token';
+  await rejects(bad.call('GET', '/repos'), 401);
+  await rejects(owner.call('POST', '/repos', { name: 'team-config' }), 409);
+  if (FIREBASE) {
+    // Sign-in itself belongs to Firebase Auth; the server's password endpoints are disabled.
+    assert.equal((await new TestUser(srv.url).call('GET', '/config')).auth, 'firebase');
+    await rejects(new TestUser(srv.url).call('POST', '/auth/login', { email: 'owner@example.com', password: 'password123' }), 400);
+    return;
+  }
+  await rejects(new TestUser(srv.url).call('POST', '/auth/login', { email: 'owner@example.com', password: 'nope' }), 401);
   const r = await new TestUser(srv.url).call('POST', '/auth/refresh', { refreshToken: owner.refreshToken });
   assert.equal(r.user.email, 'owner@example.com');
-  await rejects(owner.call('POST', '/repos', { name: 'team-config' }), 409);
 });
 
 test('blob uploads are verified and size-limited', async () => {
@@ -185,7 +194,7 @@ test('repo transfer, purge, and account deletion', async () => {
   const t = (await temp.call('POST', '/artifacts', { repoId: tr.repoId, kind: 'file', name: 'x.txt', ...(await temp.upload('x\n')) })).artifact;
   await viewer.call('POST', '/pull', { shareId: t.shareId });
   await temp.call('DELETE', '/me');
-  await rejects(temp.call('GET', '/me'), 404);
+  await rejects(temp.call('GET', '/me'), FIREBASE ? 401 : 404); // Firebase: the auth account is gone too
   const [g] = (await viewer.call('POST', '/sync/check', { items: [{ artifactId: t.artifactId, version: 1 }] })).results;
   assert.equal(g.status, 'gone');
 });

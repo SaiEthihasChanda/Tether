@@ -1,0 +1,29 @@
+{
+  "functions": [
+    {
+      "source": "firebase/functions",
+      "codebase": "default",
+      "predeploy": ["npm --prefix \"$PROJECT_DIR\" run build:functions"]
+    }
+  ],
+  "hosting": {
+    "public": "packages/console/dist",
+    "predeploy": ["npm --prefix \"$PROJECT_DIR\" run console:build"],
+    "ignore": ["firebase.json", "**/.*"],
+    "rewrites": [
+      { "source": "/v1/**", "function": { "functionId": "api", "region": "asia-south1" } },
+      { "source": "**", "destination": "/index.html" }
+    ],
+    "headers": [
+      { "source": "/assets/**", "headers": [{ "key": "Cache-Control", "value": "public, max-age=31536000, immutable" }] }
+    ]
+  },
+  "firestore": { "rules": "firebase/firestore.rules" },
+  "storage": { "rules": "firebase/storage.rules" },
+  "emulators": {
+    "auth": { "port": 9099 },
+    "firestore": { "port": 8085 },
+    "ui": { "enabled": false },
+    "singleProjectMode": true
+  }
+}

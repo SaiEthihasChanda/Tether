@@ -65,13 +65,19 @@ export function createApp({ service, auth, consoleDir, maxFileSize }) {
 
   // artifacts
   api.post('/artifacts', async (req, res) => res.json(await service.manage(req.uid, req.body)));
-  api.post('/pull', async (req, res) => res.json(await service.pull(req.uid, req.body.shareId)));
+  api.post('/pull', async (req, res) => res.json(await service.pull(req.uid, req.body.shareId, { peek: !!req.body.peek })));
   api.post('/sync/check', async (req, res) => res.json({ results: await service.check(req.uid, req.body.items) }));
   api.get('/artifacts/:id', async (req, res) => res.json(await service.getArtifact(req.uid, req.params.id)));
   api.post('/artifacts/:id/children', async (req, res) => res.json(await service.addChild(req.uid, req.params.id, req.body)));
   api.post('/artifacts/:id/commit', async (req, res) => res.json(await service.commit(req.uid, req.params.id, req.body)));
   api.post('/artifacts/:id/delete', async (req, res) => res.json(await service.deleteArtifact(req.uid, req.params.id)));
   api.post('/artifacts/:id/restore', async (req, res) => res.json(await service.restoreFolder(req.uid, req.params.id)));
+  api.post('/artifacts/:id/realtime', async (req, res) => {
+    const { action, force } = req.body;
+    if (action === 'start') return res.json(await service.startRealtime(req.uid, req.params.id));
+    if (action === 'stop') return res.json(await service.stopRealtime(req.uid, req.params.id, { force: !!force }));
+    throw badRequest('action must be start or stop');
+  });
   api.post('/artifacts/:id/rollback', async (req, res) => {
     if (req.body.toVersion === undefined) throw badRequest('toVersion required');
     res.json(await service.rollback(req.uid, req.params.id, req.body.toVersion));

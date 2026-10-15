@@ -21,7 +21,7 @@ export async function startServer(opts = {}) {
     ? await createFirebaseBackend({ firebase: opts.firebase, maxFileSize })
     : await createLocalBackend({ ...opts, dataDir, maxFileSize });
 
-  const service = new TetherService({ store: backend.store, blobs: backend.blobs, maxFileSize });
+  const service = new TetherService({ store: backend.store, blobs: backend.blobs, maxFileSize, realtimeTtlMs: opts.realtimeTtlMs });
   const consoleDir = opts.consoleDir === undefined ? path.resolve(here, '../../console/dist') : opts.consoleDir;
   const app = createApp({ service, auth: backend.auth, consoleDir, maxFileSize });
 

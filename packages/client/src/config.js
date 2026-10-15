@@ -7,6 +7,7 @@ export const DEFAULTS = {
   tickSeconds: 30,
   graceMs: 2000,
   scanRoots: [os.homedir()],
+  notifications: 'all', // all | errors | off
 };
 
 const NUMERIC = new Set(['tickSeconds', 'graceMs']);
@@ -33,6 +34,7 @@ export class Config {
       value = Number(value);
       if (!Number.isFinite(value) || value <= 0) throw new Error(`${key} must be a positive number`);
     }
+    if (key === 'notifications' && !['all', 'errors', 'off'].includes(value)) throw new Error('notifications must be all, errors or off');
     if (key === 'scanRoots' && typeof value === 'string') value = value.split(/[;,]/).map((s) => s.trim()).filter(Boolean);
     this.values[key] = value;
     fs.writeFileSync(this.file, JSON.stringify(this.values, null, 2));

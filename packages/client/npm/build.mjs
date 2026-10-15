@@ -9,6 +9,8 @@ const here = path.dirname(fileURLToPath(import.meta.url));
 const client = path.resolve(here, '..');
 const out = path.resolve(client, '../../dist/npm');
 const pkg = JSON.parse(fs.readFileSync(path.join(client, 'package.json'), 'utf8'));
+const { VERSION } = await import(new URL('../src/version.js', import.meta.url));
+if (VERSION !== pkg.version) throw new Error(`src/version.js (${VERSION}) and package.json (${pkg.version}) disagree`);
 
 // Empty the folder rather than deleting it, so a shell sitting inside it does not break the build.
 fs.mkdirSync(out, { recursive: true });

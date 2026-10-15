@@ -63,6 +63,17 @@ try {
   assert.equal(lf(bob.read('cfg.txt')), 'v1\n');
   step('history and rollback');
 
+  await bob.sync();
+  await bob.run(['edit', 'cfg.txt', '--realtime']);
+  const refused = await owner.run(['edit', 'cfg.txt', '--realtime'], { allowFail: true });
+  assert.match(refused.stderr, /already being edited in realtime/);
+  bob.write('cfg.txt', 'live from bob\n');
+  await eventually(async () => /pushed v\d+ \(realtime\)/.test(await bob.log()), { timeout: 15000, message: 'live push' });
+  await owner.sync();
+  assert.equal(lf(owner.read('cfg.txt')), 'live from bob\n');
+  await bob.run(['done', 'cfg.txt']);
+  step('realtime: live push without done; second live editor refused');
+
   await owner.run(['share', 'cfg.txt', '--demote', accounts.bob]);
   await owner.run(['share', 'kit', '--rotate-id']);
   await bob.sync();

@@ -88,6 +88,18 @@ export class MongoStore {
     return doc.currentVersion;
   }
   deleteArtifacts(ids) { return this.artifacts.deleteMany({ _id: { $in: ids } }); }
+  /** Takes or renews a realtime lease unless someone else holds an unexpired one. */
+  async claimRealtime(id, uid, session, now) {
+    const r = await this.artifacts.updateOne(
+      { _id: id, $or: [{ realtime: null }, { 'realtime.uid': uid }, { 'realtime.expiresAt': { $lt: now } }] },
+      { $set: { realtime: session } },
+    );
+    return r.matchedCount === 1;
+  }
+  /** Ends a realtime lease (only the given holder's, unless uid is null). */
+  releaseRealtime(id, uid) {
+    return this.artifacts.updateOne({ _id: id, ...(uid ? { 'realtime.uid': uid } : {}) }, { $set: { realtime: null } });
+  }
 
   // versions
   insertVersion(v) { return this.versions.insertOne(v); }

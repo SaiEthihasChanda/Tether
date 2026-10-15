@@ -121,3 +121,8 @@ code.big { font-size: 1.15rem; padding: 0.25rem 0.6rem; letter-spacing: 0.03em; 
   h1 { font-size: 1.35rem; }
   th, td { padding: 0.45rem 0.55rem; }
 }
+
+.live { display: flex; flex-wrap: wrap; align-items: center; gap: 0.5rem; background: var(--warn-soft); padding: 0.5rem 0.75rem; border-radius: 8px; }
+.live .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--danger); animation: pulse 1.6s ease-in-out infinite; }
+@keyframes pulse { 50% { opacity: 0.3; } }
+@media (prefers-reduced-motion: reduce) { .live .dot { animation: none; } }

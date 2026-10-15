@@ -12,8 +12,14 @@ import { Api, BlobCache, ApiError } from './api.js';
 import { createTracker } from './platform/tracker.js';
 import { Engine, UserError } from './engine.js';
 import { listen } from './ipc.js';
+import { VERSION } from './version.js';
+import { latestVersion, isNewer } from './update.js';
+import { Notifier } from './notifier.js';
+import { fileURLToPath } from 'node:url';
 
-export const VERSION = '0.1.0';
+export { VERSION };
+const REALTIME_TICK_SECONDS = 3; // check cadence while a live session is involved
+const UPDATE_CHECK_MS = 24 * 60 * 60 * 1000;
 
 export async function runDaemon() {
   const home = tetherHome();
@@ -35,30 +41,63 @@ export async function runDaemon() {
   const api = new Api({ config, credentials });
   const cache = new BlobCache(f.blobs);
   const tracker = await createTracker(config);
-  const engine = new Engine({ db, api, cache, tracker, config, log });
+  const notifier = new Notifier({ setting: () => config.get('notifications'), consoleUrl: () => config.consoleUrl, log });
+  const engine = new Engine({
+    db, api, cache, tracker, config, log, home,
+    notify: (e) => notifier.notify(e),
+    cliPath: fileURLToPath(new URL('../bin/tether.js', import.meta.url)),
+  });
 
   // ---- timer ----
   let timer = null;
   let quickTimer = null;
+  let realtimeTimer = null;
   let stopping = false;
+  let latest = null; // newest tether-sync on npm, checked daily
 
   async function runTick(opts) {
     try {
       await engine.locked(() => engine.tick(opts));
     } catch (e) {
       log(`tick failed: ${e.stack || e.message}`);
+      notifier.notify({ kind: 'error', level: 'error', key: 'tick-failed', cooldownMs: 3600 * 1000, title: 'Tether hit an error', body: `${e.message}. Run "tether log" for details.` });
     }
     refreshWatchers();
     scheduleGrace();
+    schedule(); // the cadence depends on what this pass saw (realtime sessions)
   }
 
   function schedule() {
     clearTimeout(timer);
     if (stopping) return;
-    timer = setTimeout(async () => {
-      await runTick();
-      schedule();
-    }, config.get('tickSeconds') * 1000);
+    const seconds = engine.realtimeActive ? Math.min(config.get('tickSeconds'), REALTIME_TICK_SECONDS) : config.get('tickSeconds');
+    timer = setTimeout(() => runTick(), seconds * 1000);
+  }
+
+  /** Pushes live edits about a second after the last change (debounced). */
+  function realtimePass(delay = 1000) {
+    if (stopping || !engine.realtimeInstances().length) return;
+    clearTimeout(realtimeTimer);
+    realtimeTimer = setTimeout(async () => {
+      realtimeTimer = null;
+      try {
+        await engine.locked(async () => {
+          await engine.locateAll();
+          await engine.syncRealtime();
+        });
+      } catch (e) {
+        log(`realtime push failed: ${e.message}`);
+      }
+    }, delay);
+  }
+
+  let notifiedVersion = null;
+  async function checkForUpdate() {
+    latest = (await latestVersion()) ?? latest;
+    if (isNewer(latest, VERSION) && notifiedVersion !== latest) {
+      notifiedVersion = latest;
+      notifier.notify({ kind: 'update', level: 'info', title: 'Tether update available', body: `Version ${latest} is available (you have ${VERSION}). Run "tether update".` });
+    }
   }
 
   /** A quick local pass (no network) after watcher events and when a grace window ends. */
@@ -98,7 +137,10 @@ export async function runDaemon() {
     for (const [dir, recursive] of want) {
       if (watchers.has(dir)) continue;
       try {
-        const w = fs.watch(dir, { recursive, persistent: false }, () => quickPass(250));
+        const w = fs.watch(dir, { recursive, persistent: false }, () => {
+          quickPass(250);
+          realtimePass();
+        });
         w.on('error', () => {
           w.close();
           watchers.delete(dir);
@@ -149,7 +191,10 @@ export async function runDaemon() {
     ping: () => ({ pid: process.pid, version: VERSION, home, tracker: tracker.name, server: config.get('server') }),
     async status(p) {
       const creds = await credentials.load();
-      return { user: creds?.user ?? null, server: config.get('server'), offline: engine.offline, lastTick: engine.lastTick, instances: await L((x) => engine.status(x))(p) };
+      return {
+        user: creds?.user ?? null, server: config.get('server'), offline: engine.offline, lastTick: engine.lastTick,
+        version: VERSION, latest, instances: await L((x) => engine.status(x))(p),
+      };
     },
     sync: async () => {
       await runTick();
@@ -177,8 +222,18 @@ export async function runDaemon() {
     manage: L((p) => engine.manage(p)),
     add: L((p) => engine.add(p)),
     pull: L((p) => engine.pull(p)),
-    edit: L((p) => engine.edit(p)),
+    edit: async (p) => {
+      const r = await L((x) => engine.edit(x))(p);
+      schedule(); // switch to the realtime cadence right away
+      return r;
+    },
     unmanage: L((p) => engine.unmanage(p)),
+    'git.mode': L((p) => engine.gitMode(p)),
+    // Called by git hooks: answer at once so git is not held up; reconcile in the background.
+    'git.sync': ({ repo }) => {
+      engine.locked(() => engine.gitReconcile(path.resolve(repo))).catch((e) => log(`git sync failed: ${e.message}`));
+      return { queued: true };
+    },
     plan: L((p) => engine.plan(p)),
     resolve: L((p) => engine.resolve(p)),
     diff: L((p) => engine.diff(p)),
@@ -254,6 +309,8 @@ export async function runDaemon() {
     stopping = true;
     clearTimeout(timer);
     clearTimeout(quickTimer);
+    clearTimeout(realtimeTimer);
+    clearInterval(updateTimer);
     for (const w of watchers.values()) w.close();
     server.close();
     engine.locked(() => db.close()).finally(() => {
@@ -265,6 +322,8 @@ export async function runDaemon() {
   process.on('SIGINT', () => shutdown(0));
   process.on('SIGTERM', () => shutdown(0));
 
+  await engine.locked(() => engine.syncGitHooks()).catch((e) => log(`git hooks: ${e.message}`));
+  const updateTimer = setInterval(checkForUpdate, UPDATE_CHECK_MS);
+  setTimeout(checkForUpdate, 5000);
   await runTick();
-  schedule();
 }

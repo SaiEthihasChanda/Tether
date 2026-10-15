@@ -29,10 +29,54 @@ function sharingView(a) {
 }
 
 export class TetherService {
-  constructor({ store, blobs, maxFileSize }) {
+  constructor({ store, blobs, maxFileSize, realtimeTtlMs = 5 * 60 * 1000 }) {
     this.store = store;
     this.blobs = blobs;
     this.maxFileSize = maxFileSize;
+    this.realtimeTtlMs = realtimeTtlMs;
+  }
+
+  // ---- realtime edit sessions ----
+  // One editor at a time may push a file live (`tether edit --realtime`). The session is a
+  // lease: renewed by that editor's client on every check, gone after realtimeTtlMs without one.
+
+  /** The live session on an artifact, if it is unexpired and its holder can still edit. */
+  activeRealtime(a, root, now = Date.now()) {
+    const s = a.realtime;
+    if (!s || s.expiresAt < now) return null;
+    if (root.ownerUid !== s.uid && !root.editors?.[s.uid]) return null;
+    return s;
+  }
+
+  realtimeView(s, uid) {
+    return s ? { email: s.email, since: s.since, mine: s.uid === uid } : null;
+  }
+
+  async startRealtime(uid, artifactId) {
+    const { artifact: a, root, role } = await this.access(uid, artifactId);
+    if (role === 'viewer') throw forbidden('realtime editing needs editor access');
+    if (a.kind !== 'file') throw badRequest('realtime sessions are per file');
+    if (a.deleted || root.deleted) throw conflict('artifact has been deleted');
+    const now = Date.now();
+    const cur = this.activeRealtime(a, root, now);
+    if (cur && cur.uid !== uid) throw conflict(`being edited in realtime by ${cur.email}`, { realtime: this.realtimeView(cur, uid) });
+    // A stored lease whose holder can no longer edit (demoted, removed) is stale: clear it.
+    if (!cur && a.realtime && a.realtime.uid !== uid) await this.store.releaseRealtime(a._id, a.realtime.uid);
+    const user = await this.store.userById(uid);
+    const session = { uid, email: user?.email ?? uid, since: cur?.uid === uid ? cur.since : now, expiresAt: now + this.realtimeTtlMs };
+    if (!(await this.store.claimRealtime(a._id, uid, session, now))) {
+      const fresh = await this.store.artifactById(a._id);
+      throw conflict(`being edited in realtime by ${fresh.realtime?.email}`, { realtime: this.realtimeView(fresh.realtime, uid) });
+    }
+    return { realtime: this.realtimeView(session, uid) };
+  }
+
+  /** Ends the caller's session. The owner may also end someone else's (force). */
+  async stopRealtime(uid, artifactId, { force = false } = {}) {
+    const { role } = await this.access(uid, artifactId);
+    if (force && role !== 'owner') throw forbidden('only the owner can end someone else\'s realtime session');
+    await this.store.releaseRealtime(artifactId, force ? null : uid);
+    return { ok: true };
   }
 
   // ---- roles ----
@@ -284,20 +328,20 @@ export class TetherService {
   }
 
   /** `tether pull <shareId>`. Records a link grant so rotation can revoke it later. */
-  async pull(uid, shareId) {
+  async pull(uid, shareId, { peek = false } = {}) {
     const root = await this.store.artifactByShareId(String(shareId || '').trim());
     if (!root) throw notFound('no artifact with that share ID (it may have been rotated)');
     if (root.deleted) throw notFound('that artifact has been deleted');
     let r = this.roleOf(uid, root, { shareId: root.shareId });
     if (!r.role) throw forbidden('this artifact is restricted to an allowlist and you are not on it');
-    if (r.role === 'viewer' && root.visibility === 'link') await this.store.addGrant(root._id, uid, root.shareId);
+    if (!peek && r.role === 'viewer' && root.visibility === 'link') await this.store.addGrant(root._id, uid, root.shareId);
     const children = root.kind === 'folder' ? (await this.store.childrenOf(root._id)).filter((c) => !c.deleted).map(view) : [];
     return { artifact: view(root), children, role: r.role, canDelete: r.canDelete };
   }
 
   async getArtifact(uid, artifactId) {
     const { artifact, root, role, canDelete } = await this.access(uid, artifactId);
-    const out = { artifact: view(artifact), role, canDelete };
+    const out = { artifact: view(artifact), role, canDelete, realtime: this.realtimeView(this.activeRealtime(artifact, root), uid) };
     if (role === 'owner' && !artifact.parentFolderId) Object.assign(out.artifact, sharingView(artifact));
     if (artifact.kind === 'folder') out.children = (await this.store.childrenOf(artifact._id)).map(view);
     if (artifact.parentFolderId) out.folder = view(root);
@@ -318,20 +362,43 @@ export class TetherService {
     const grants = new Map((await this.store.grantsOf(uid, rootIds)).map((g) => [g.artifactId, g]));
     const changedFolders = items.filter((i) => arts.get(i.artifactId)?.kind === 'folder' && arts.get(i.artifactId).currentVersion !== i.version).map((i) => i.artifactId);
     const kids = changedFolders.length ? await this.store.childrenOfMany(changedFolders) : [];
-    return items.map(({ artifactId, version }) => {
+    const now = Date.now();
+    const user = items.some((i) => i.realtime) ? await this.store.userById(uid) : null;
+    const results = [];
+    for (const { artifactId, version, realtime } of items) {
       const a = arts.get(artifactId);
-      if (!a) return { artifactId, status: 'gone', reason: 'purged' };
+      if (!a) {
+        results.push({ artifactId, status: 'gone', reason: 'purged' });
+        continue;
+      }
       const root = a.parentFolderId ? arts.get(a.parentFolderId) : a;
-      if (!root) return { artifactId, status: 'gone', reason: 'purged' };
+      if (!root) {
+        results.push({ artifactId, status: 'gone', reason: 'purged' });
+        continue;
+      }
       const { role, canDelete } = this.roleOf(uid, root, grants.get(root._id));
-      if (!role) return { artifactId, status: 'gone', reason: 'revoked' };
-      const out = { artifactId, role, canDelete, version: a.currentVersion, folderDeleted: !!(a.parentFolderId && root.deleted) };
-      if (a.currentVersion === version) return { ...out, status: 'ok' };
+      if (!role) {
+        results.push({ artifactId, status: 'gone', reason: 'revoked' });
+        continue;
+      }
+      let rt = a.kind === 'file' ? this.activeRealtime(a, root, now) : null;
+      // The holder's client renews its lease with every check (re-claiming it if it lapsed and nobody took it).
+      if (realtime && role !== 'viewer' && (!rt || rt.uid === uid) && !a.deleted) {
+        if (!rt && a.realtime && a.realtime.uid !== uid) await this.store.releaseRealtime(a._id, a.realtime.uid);
+        const session = { uid, email: user?.email ?? uid, since: rt?.since ?? now, expiresAt: now + this.realtimeTtlMs };
+        if (await this.store.claimRealtime(a._id, uid, session, now)) rt = session;
+      }
+      const out = { artifactId, role, canDelete, version: a.currentVersion, folderDeleted: !!(a.parentFolderId && root.deleted), realtime: this.realtimeView(rt, uid) };
+      if (a.currentVersion === version) {
+        results.push({ ...out, status: 'ok' });
+        continue;
+      }
       out.status = 'changed';
       out.state = view(a);
       if (a.kind === 'folder') out.children = kids.filter((k) => k.parentFolderId === a._id).map(view);
-      return out;
-    });
+      results.push(out);
+    }
+    return results;
   }
 
   /**

@@ -362,6 +362,55 @@ Behaviours the build had to settle where the design was silent:
 - **Repo transfer:** the previous owner stays on as an editor with delete permission.
 - **`tether share --demote`** turns an editor into an allowlisted viewer.
 
+## 12b. Realtime editing (2026-10-15)
+
+`tether edit <path> --realtime` is for editors and owners.
+
+- **Live pushes.** Every save is pushed about a second later, with no `tether done` needed. The base-version check still applies to each push.
+- **One live editor per file.** The server holds a lease per file (`realtime: {uid, email, since, expiresAt}` on the artifact). The holder's client renews it with every check. It expires after 5 minutes without a renewal, so a crashed or offline machine cannot lock a file forever. A lease whose holder is no longer an editor is ignored and cleared.
+- **Another editor's `--realtime` is refused.** The refusal names the holder. A plain `tether edit` is allowed but warns that the file is being edited live and to expect merge conflicts.
+- **Faster checks during a session.** Clients that hold the file see the session in their check results and check every 3 s instead of every 30 s while it lasts. The first switch can take up to one normal interval.
+- **Conflicts pause live pushing.** If someone else pushes while the live editor has unsent changes, live pushing stops and `tether done` resolves it with the usual prompt.
+- **Ending a session.** `tether done` or `tether unmanage` ends it. The owner can end someone else's session from the console.
+- **History grows faster.** Each live save is a version, so history grows with it. This is one more reason for the deferred history retention policy.
+
+`tether update` checks npm for a newer `tether-sync`. It stops the daemon, which holds native files open on Windows, reinstalls into the same npm prefix, and restarts the daemon. A development checkout refuses to self-update. The daemon checks for updates once a day and `tether status` mentions when one is available.
+
+## 12c. Git repositories and notifications (2026-10-15)
+
+**Managed files inside a git repository.** `manage` and `pull` detect the repository and ask how Tether and git share the file. `--git` answers without the prompt, and a non-interactive run defaults to keep. Stored per instance as `gitMode`:
+- **keep:** Tether is the mirror. Git's changes are reverted, like any local edit, with a notification.
+- **skip:** not managed.
+- **follow** (editors and owners only):
+  - Hooks (`post-merge`, `post-checkout`, `post-rewrite`) tell the daemon over IPC that git changed files. A block is added per Tether profile, and existing hook content is kept.
+  - On that signal, git's version of each changed follow-mode file is pushed (base-version check as usual).
+  - If Tether also has a newer version, the file stays in editing mode with a notification, and `tether done` resolves it.
+  - Hooks are removed when no follow-mode files remain in the repo.
+
+While git is mid-operation (`index.lock`, or a merge, rebase, cherry-pick or revert in progress), Tether writes nothing in that repository. When a merge or rebase finishes (busy changes to idle), follow-mode files are reconciled even without a hook.
+
+A follow-mode file that git removes, as on a branch switch, is kept and picked up again when git restores it. Switching between branches that hold different versions therefore publishes each version. That is the intended "git's version wins" behavior.
+
+Demotion to viewer turns follow into keep.
+
+**Limit:** in keep mode, Tether's updates leave the file modified in git's eyes, so a later `git pull` that touches the file may refuse until the change is stashed or committed.
+
+**Notifications.** The daemon shows desktop notifications: Windows toasts under the registered app ID `Tether.Sync`, or `notify-send` on Linux.
+- **Events:**
+  - reverted local or git changes
+  - conflicts (live editing, or git with Tether)
+  - failed pushes
+  - lost live sessions
+  - demotion
+  - revoked or deleted artifacts
+  - files locked by other programs
+  - sign-in expiry
+  - failed sync passes
+  - available updates
+- **Grouping:** events are grouped over 3 seconds ("(+2 more)"), and repeats are rate-limited.
+- **Clicking:** opens the artifact (or the console) in the browser.
+- **Setting:** `notifications` = `all` | `errors` | `off`.
+
 ## 13. Open questions
 
 1. **Size limit:** what per-file (and per-repo) maximum?

@@ -29,12 +29,18 @@ const COLUMNS = {
   detached: 'INTEGER DEFAULT 0', // file in a folder that the user deleted; restored by `tether track`
   needsRestore: 'INTEGER DEFAULT 0', // write a fresh copy at the expected path on the next tick
   orphanReason: 'TEXT',
+  realtime: 'INTEGER DEFAULT 0', // this client holds a realtime session and pushes every save
+  remoteRealtime: 'TEXT', // JSON { email, since } when someone else edits this file in realtime
+  gitMode: 'TEXT', // inside a git repo: keep (Tether reverts git's changes) | follow (git's changes are published)
+  gitRoot: 'TEXT',
+  gitDir: 'TEXT',
+  gitHooks: 'TEXT',
   lastError: 'TEXT',
   createdAt: 'REAL',
   updatedAt: 'REAL',
 };
 
-const BOOL = new Set(['hasBom', 'exec', 'canDelete', 'detached', 'needsRestore']);
+const BOOL = new Set(['realtime', 'hasBom', 'exec', 'canDelete', 'detached', 'needsRestore']);
 
 export class LocalDb {
   constructor(file) {

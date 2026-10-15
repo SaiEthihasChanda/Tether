@@ -218,6 +218,28 @@ export class FirestoreStore {
       return v;
     });
   }
+  /** Takes or renews a realtime lease unless someone else holds an unexpired one. */
+  claimRealtime(id, uid, session, now) {
+    const ref = this.c('artifacts').doc(id);
+    return this.db.runTransaction(async (tx) => {
+      const snap = await tx.get(ref);
+      if (!snap.exists) return false;
+      const cur = snap.get('realtime');
+      if (cur && cur.uid !== uid && cur.expiresAt >= now) return false;
+      tx.update(ref, { realtime: session });
+      return true;
+    });
+  }
+  /** Ends a realtime lease (only the given holder's, unless uid is null). */
+  releaseRealtime(id, uid) {
+    const ref = this.c('artifacts').doc(id);
+    return this.db.runTransaction(async (tx) => {
+      const snap = await tx.get(ref);
+      if (!snap.exists) return;
+      if (!uid || snap.get('realtime')?.uid === uid) tx.update(ref, { realtime: null });
+    });
+  }
+
   async deleteArtifacts(ids) {
     for (const part of chunks(ids, BATCH)) {
       const b = this.db.batch();

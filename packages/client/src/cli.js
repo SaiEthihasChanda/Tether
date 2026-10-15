@@ -7,6 +7,9 @@ import { Command, Option } from 'commander';
 import { ipcEndpoint } from './paths.js';
 import { call, IpcError } from './ipc.js';
 import { spawnDaemon, install, uninstall, installed } from './autostart.js';
+import { VERSION } from './version.js';
+import { latestVersion, isNewer, installDir, prefixOf, npmInstall, PACKAGE } from './update.js';
+import { findRepo } from './git.js';
 
 const endpoint = () => ipcEndpoint();
 
@@ -92,8 +95,34 @@ async function resolveFlow(p, from, opts) {
   if (results.some((r) => r.error)) process.exitCode = 1;
 }
 
+/**
+ * A managed path inside a git repository: ask how Tether and git share it (or use --git).
+ * Returns 'keep' | 'follow' | 'skip', or undefined when the path is not in a git repository.
+ */
+async function chooseGitMode(target, flag, canFollow) {
+  const repo = findRepo(target);
+  if (!repo) return undefined;
+  if (flag) {
+    if (flag === 'follow' && !canFollow) throw new Error('--git follow needs editor access (you are a viewer); use --git keep or --git skip');
+    return flag;
+  }
+  if (!process.stdin.isTTY) {
+    out(`note: ${target} is inside the git repository ${repo.root}; Tether will revert git's changes to it. Choose with --git keep|follow|skip.`);
+    return 'keep';
+  }
+  out(`${target} is inside the git repository ${repo.root}.`);
+  out('How should Tether treat it when git changes it?');
+  out("  [1] keep managing it: git's changes (pull, checkout, switch, merge) may get reverted to Tether's version");
+  out('  [2] do not let Tether manage it');
+  if (canFollow) out("  [3] manage it, and after a git pull, checkout, switch or merge accept git's version and publish it to Tether");
+  else out('  (option 3, accepting git\'s changes, needs editor access)');
+  const choice = await ask('  > ', canFollow ? ['1', '2', '3'] : ['1', '2']);
+  return { 1: 'keep', 2: 'skip', 3: 'follow' }[choice];
+}
+
 function printStatus(s, verbose) {
   out(`server: ${s.server}  user: ${s.user ? s.user.email : '(not signed in)'}${s.offline ? `  OFFLINE: ${s.offline}` : ''}`);
+  if (isNewer(s.latest, s.version)) out(`update available: ${s.version} -> ${s.latest} (run \`tether update\`)`);
   if (!s.instances.length) return out('nothing managed yet');
   const folders = new Map(s.instances.filter((i) => i.kind === 'folder').map((i) => [i.instanceId, i]));
   for (const i of s.instances) {
@@ -126,7 +155,7 @@ export async function main(argv) {
     if (e.code === 'EPIPE') process.exit(0);
     throw e;
   });
-  const program = new Command('tether').description('Keep files in sync with a central source of truth, wherever they live.').version('0.1.0');
+  const program = new Command('tether').description('Keep files in sync with a central source of truth, wherever they live.').version(VERSION);
   program.showHelpAfterError();
 
   program.command('login').description('sign in (opens the browser)')
@@ -193,8 +222,11 @@ export async function main(argv) {
   program.command('manage <path>').description('upload a file or folder into a repo; you become its owner')
     .requiredOption('--repo <repo>')
     .addOption(new Option('--eol <mode>').choices(['auto', 'lf', 'crlf', 'binary']))
+    .addOption(new Option('--git <mode>', 'inside a git repo: keep (Tether reverts git changes), follow (publish git changes), skip').choices(['keep', 'follow', 'skip']))
     .action(async (p, o) => {
-      const r = await daemon('manage', { path: path.resolve(p), repo: o.repo, eol: o.eol });
+      const gitMode = await chooseGitMode(path.resolve(p), o.git, true);
+      if (gitMode === 'skip') return out('not managed');
+      const r = await daemon('manage', { path: path.resolve(p), repo: o.repo, eol: o.eol, gitMode });
       out(`managing ${r.path} (${r.kind}${r.kind === 'folder' ? `, ${r.files} files` : ''})`);
       if (r.skippedSymlinks?.length) out(`skipped symlinks: ${r.skippedSymlinks.join(', ')}`);
       out(`share ID: ${r.shareId}`);
@@ -203,8 +235,13 @@ export async function main(argv) {
     const r = await daemon('add', { path: path.resolve(p) });
     out(`added ${r.relPath} to ${r.folder}`);
   });
-  program.command('pull <shareId> [dest]').description('get a managed copy').action(async (shareId, dest) => {
-    const r = await daemon('pull', { shareId, dest, cwd: process.cwd() });
+  program.command('pull <shareId> [dest]').description('get a managed copy')
+    .addOption(new Option('--git <mode>', 'inside a git repo: keep (Tether reverts git changes), follow (publish git changes; editors), skip').choices(['keep', 'follow', 'skip']))
+    .action(async (shareId, dest, o) => {
+    const peek = await daemon('pull', { shareId, dest, cwd: process.cwd(), peek: true });
+    const gitMode = await chooseGitMode(peek.path, o.git, peek.role !== 'viewer');
+    if (gitMode === 'skip') return out('not pulled');
+    const r = await daemon('pull', { shareId, dest, cwd: process.cwd(), gitMode });
     out(`pulled ${r.path} (${r.kind}${r.kind === 'folder' ? `, ${r.files} files` : ''}, v${r.version}) as ${r.role}`);
   });
   program.command('status [path]').description('modes, pending changes, problems')
@@ -216,10 +253,21 @@ export async function main(argv) {
       printStatus(s, o.verbose);
     });
 
-  program.command('edit <path>').description('start editing: local changes are kept until `tether done`').action(async (p) => {
-    const r = await daemon('edit', { path: path.resolve(p) });
-    out(r.changed.length ? `editing ${r.changed.length} file(s); run \`tether done ${p}\` to finish` : 'nothing to change (already editing?)');
-  });
+  program.command('edit <path>').description('start editing: local changes are kept until `tether done`')
+    .option('--realtime', 'push every save immediately (editors only, one realtime editor per file)')
+    .action(async (p, o) => {
+      const r = await daemon('edit', { path: path.resolve(p), realtime: !!o.realtime });
+      if (r.realtime) {
+        out(`editing ${r.changed.length} file(s) in realtime: every save is pushed to everyone within seconds.`);
+        out(`Other editors cannot start realtime on them until you run \`tether done ${p}\`.`);
+        return;
+      }
+      out(r.changed.length ? `editing ${r.changed.length} file(s); run \`tether done ${p}\` to finish` : 'nothing to change (already editing?)');
+      for (const w of r.warnings ?? []) {
+        out(`warning: ${w.path} is being edited in realtime by ${w.email} (since ${new Date(w.since).toLocaleTimeString()}).`);
+        out('         Their changes keep arriving on the server; expect merge conflicts when you run `tether done`.');
+      }
+    });
   program.command('done [path]').description('finish editing: push changes and resolve conflicts')
     .addOption(new Option('--resolve <choice>', 'answer every question with this choice').choices(['push', 'accept', 'keep-both', 'cancel', 'delete', 'stop']))
     .action((p, o) => resolveFlow(p, 'editing', o));
@@ -325,6 +373,49 @@ export async function main(argv) {
     uninstall();
     out('removed from login startup');
   });
+
+  program.command('update').description(`update tether to the latest version on npm (${PACKAGE})`)
+    .option('--check', 'only check whether an update is available')
+    .action(async (o) => {
+      const latest = await latestVersion();
+      if (!latest) throw new Error('could not reach the npm registry');
+      if (!isNewer(latest, VERSION)) return out(`tether ${VERSION} is up to date`);
+      if (o.check) return out(`update available: ${VERSION} -> ${latest} (run \`tether update\`)`);
+      const pkgDir = installDir();
+      if (!pkgDir) throw new Error('this tether is a development copy (not installed from npm); update it with `git pull` and `npm install`');
+      out(`updating tether ${VERSION} -> ${latest}`);
+      // The daemon holds native files open (Windows will not replace them), so stop it first.
+      let wasRunning = false;
+      try {
+        await call(endpoint(), 'shutdown', {}, 3000);
+        wasRunning = true;
+        for (let i = 0; i < 50; i++) {
+          await new Promise((r) => setTimeout(r, 100));
+          await call(endpoint(), 'ping', {}, 500);
+        }
+      } catch {
+        // stopped (or was not running)
+      }
+      const code = npmInstall(process.env.TETHER_UPDATE_SPEC || `${PACKAGE}@${latest}`, prefixOf(pkgDir));
+      if (code !== 0) {
+        if (wasRunning) spawnDaemon();
+        throw new Error('npm install failed; tether was not updated. If another Tether daemon from this install is running (another TETHER_HOME), stop it and try again.');
+      }
+      if (wasRunning) spawnDaemon(); // starts the newly installed daemon
+      out(`updated to ${latest}`);
+    });
+
+  program.command('git <path>').description('show or change how a managed file shares its git repository')
+    .addOption(new Option('--mode <mode>', "keep: Tether reverts git's changes; follow: git's changes are published (editors)").choices(['keep', 'follow']))
+    .action(async (p, o) => {
+      for (const i of await daemon('git.mode', { path: path.resolve(p), mode: o.mode })) {
+        out(`${(i.gitMode ?? (i.gitRoot ? 'keep' : '-')).padEnd(7)} ${(i.role ?? '').padEnd(6)} ${i.path}${i.gitRoot ? '' : '  (not in a git repo)'}`);
+      }
+    });
+  program.command('git-sync', { hidden: true }).description('used by git hooks').requiredOption('--repo <dir>').option('--hook <name>')
+    .action(async (o) => {
+      await daemon('git.sync', { repo: path.resolve(o.repo), hook: o.hook });
+    });
 
   program.command('sync').description('run a sync pass now').action(async () => {
     const r = await daemon('sync');

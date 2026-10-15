@@ -41,9 +41,39 @@ tether status
 tether edit .editorconfig    # ...change it...    tether done .editorconfig
 tether share .editorconfig --editor friend@example.com
 tether daemon install        # start tetherd at login
+tether edit notes.md --realtime   # editors: every save is pushed live until `tether done`
+tether update                # install the latest tether-sync from npm
+tether git repo/.eslintrc --mode follow   # in a git repo: publish git's changes instead of reverting them
+tether config set notifications errors    # desktop notifications: all | errors | off
 ```
 
+**Files inside git repositories.** When you `manage` or `pull` into a git repo, Tether asks how to share the file with git:
+1. **keep:** Tether stays the mirror, so git's changes may be reverted.
+2. **skip:** don't manage the file.
+3. **follow** (editors only): after a git pull, checkout, switch, merge or rebase, git's version is accepted and published to Tether. Git hooks are added to the repo for this.
+
+Use `--git keep|follow|skip` to skip the question. Change it later with `tether git <path> --mode`.
+
+**Notifications.** The daemon shows desktop notifications (Windows toasts, or `notify-send` on Linux) for:
+- reverted changes (grouped)
+- conflicts and failed pushes
+- live sessions that end
+- revoked access
+- sign-in problems
+- available updates
+
+Clicking one opens the console.
+
 The CLI starts the background daemon automatically when needed. Run `tether --help` to see every command.
+
+## Release the CLI
+
+1. Bump the version in `packages/client/package.json` and `packages/client/src/version.js`. The build refuses to run if they differ.
+2. Run `npm run build:cli`.
+3. Run `cd dist/npm` and `npm publish`, entering the Authy code when asked.
+4. Approve the staged release on npmjs.com.
+
+`tether update` then picks up the new version.
 
 ## Deploy
 
@@ -66,8 +96,8 @@ Local server settings are `TETHER_MONGO_URL`, `TETHER_PORT`, `TETHER_DATA_DIR`, 
 ## Tests
 
 ```sh
-npm test                 # 77 tests on the local backend (in-memory MongoDB), about 90 s
-npm run test:firebase    # the same 77 tests on Firestore + Firebase Auth emulators (needs Java)
+npm test                 # 112 tests on the local backend (in-memory MongoDB), about 90 s
+npm run test:firebase    # the same 112 tests on Firestore + Firebase Auth emulators (needs Java)
 node test/prod-smoke.mjs            # two real clients against production (temporary accounts, deleted afterwards)
 node test/prod-console-smoke.mjs    # console + browser login against production
 ```

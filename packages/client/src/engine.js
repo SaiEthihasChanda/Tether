@@ -5,6 +5,7 @@ import path from 'node:path';
 import { createTwoFilesPatch } from 'diff';
 import { canonicalize, sha256, resolveEol, newInstanceId, nameError, relPathError, caseCollisionError, isBinary } from '@tether/shared';
 import { ApiError, OfflineError } from './api.js';
+import { findRepo, gitBusy, installHooks, removeHooks, GIT_MODES } from './git.js';
 import {
   readLocal, writeLocal, styleOf, LockedError, keepBothName, moveFile, pruneEmptyDirs, walkFiles,
   samePath, isUnder, canonicalPath, statOrNull,
@@ -15,13 +16,18 @@ export class UserError extends Error {}
 const ACTIVE = (i) => i.mode !== 'orphaned';
 
 export class Engine {
-  constructor({ db, api, cache, tracker, config, log = () => {} }) {
+  constructor({ db, api, cache, tracker, config, log = () => {}, notify = () => {}, home = null, cliPath = null }) {
     this.db = db;
     this.api = api;
     this.cache = cache;
     this.tracker = tracker;
     this.config = config;
     this.log = log;
+    this.notify = notify;
+    this.home = home;
+    this.cliPath = cliPath;
+    this.gitState = new Map(); // gitDir -> busy reason seen on the last pass
+    this.busyCache = null;
     this.offline = null;
     this.lastTick = null;
     this.graceDue = null; // timestamp when a pending atomic-save grace window expires
@@ -76,10 +82,225 @@ export class Engine {
   // ---------- tick ----------
 
   async tick({ remote = true } = {}) {
+    this.busyCache = new Map();
     await this.locateAll();
-    if (remote) await this.checkRemote();
+    if (remote) await this.gitTransitions();
+    if (remote) {
+      await this.checkRemote();
+      await this.syncRealtime();
+    }
     await this.enforceLocal();
     this.lastTick = Date.now();
+  }
+
+  // ---------- git integration ----------
+
+  isGitBusy(inst) {
+    if (!inst.gitDir) return false;
+    this.busyCache ??= new Map();
+    if (!this.busyCache.has(inst.gitDir)) this.busyCache.set(inst.gitDir, gitBusy(inst.gitDir));
+    return !!this.busyCache.get(inst.gitDir);
+  }
+
+  /** Sets the git mode on an instance (and a folder's files). Throws if follow is not allowed. */
+  applyGitMode(root, mode) {
+    if (!root) return;
+    if (!GIT_MODES.includes(mode)) throw new UserError(`git mode must be one of ${GIT_MODES.join(', ')}`);
+    if (mode === 'follow' && root.role === 'viewer') throw new UserError('git follow mode needs editor access');
+    const repo = findRepo(root.path);
+    if (!repo) throw new UserError(`${root.path} is not inside a git repository`);
+    const fields = { gitMode: mode, gitRoot: repo.root, gitDir: repo.gitDir, gitHooks: repo.hooksDir };
+    for (const i of [root, ...(root.kind === 'folder' ? this.db.childrenOf(root.instanceId) : [])]) this.db.update(i.instanceId, fields);
+    this.syncGitHooks();
+  }
+
+  /** `tether git <path> [--mode]`: show or change the git mode of managed files. */
+  gitMode({ path: p, mode }) {
+    const ts = this.targets(p);
+    const folders = new Set(ts.filter((i) => i.kind === 'folder').map((i) => i.instanceId));
+    // A managed folder carries the mode for its files; single files inside it cannot differ.
+    if (mode) for (const i of ts.filter((x) => !x.folderInstanceId || !folders.has(x.folderInstanceId))) this.applyGitMode(i.folderInstanceId ? this.db.get(i.folderInstanceId) : i, mode);
+    return this.targets(p).map((i) => ({ path: i.path, kind: i.kind, role: i.role, gitMode: this.db.get(i.instanceId)?.gitMode ?? null, gitRoot: this.db.get(i.instanceId)?.gitRoot ?? findRepo(i.path)?.root ?? null }));
+  }
+
+  /** Installs hooks in repositories with follow-mode files and removes them where none remain. */
+  syncGitHooks() {
+    if (!this.home || !this.cliPath) return;
+    const want = new Set(this.db.all().filter((i) => i.gitMode === 'follow' && i.mode !== 'orphaned' && i.gitHooks).map((i) => i.gitHooks));
+    const had = new Set(this.db.getMeta('gitHooks') ?? []);
+    for (const dir of want) {
+      try {
+        installHooks(dir, { home: this.home, node: process.execPath, cli: this.cliPath });
+      } catch (e) {
+        this.log(`could not install git hooks in ${dir}: ${e.message}`);
+      }
+    }
+    for (const dir of had) if (!want.has(dir)) removeHooks(dir, this.home);
+    this.db.setMeta('gitHooks', [...want]);
+  }
+
+  /** Repositories that just finished a git operation (merge resolved, rebase done) get reconciled. */
+  async gitTransitions() {
+    const dirs = new Map();
+    for (const i of this.db.all()) if (i.gitMode === 'follow' && i.gitDir && i.mode !== 'orphaned') dirs.set(i.gitDir, i.gitRoot);
+    for (const [gitDir, root] of dirs) {
+      const busy = gitBusy(gitDir);
+      const was = this.gitState.get(gitDir);
+      this.gitState.set(gitDir, busy);
+      if (was && !busy) await this.gitReconcile(root);
+    }
+  }
+
+  /**
+   * After git changed files (hook, or the end of a merge/rebase): publish git's version of
+   * follow-mode files. If Tether also moved on, the file stays in editing mode for `tether done`.
+   */
+  async gitReconcile(root) {
+    if (gitBusy(findRepo(root)?.gitDir)) return { busy: true };
+    const mine = () => this.db.all().filter((i) => i.gitMode === 'follow' && i.kind === 'file' && i.mode === 'normal' && i.gitRoot && samePath(i.gitRoot, root));
+    for (const i of mine().filter((x) => x.detached)) {
+      if (statOrNull(i.path)?.isFile()) {
+        this.db.update(i.instanceId, { ...this.identity(i.path), detached: false, missingSince: null, size: null, mtimeMs: null });
+        this.log(`${i.path}: back (restored by git)`);
+      }
+    }
+    await this.locateAll();
+    const changed = [];
+    for (const i of mine().filter((x) => !x.detached)) {
+      try {
+        const local = readLocal(i.path, i.eolMode);
+        if (local && local.hash !== i.baseHash) changed.push({ inst: i, local });
+      } catch {
+        // locked: the next pass will retry
+      }
+    }
+    if (!changed.length) return { published: 0 };
+    let results;
+    try {
+      ({ results } = await this.api.call('POST', '/sync/check', { items: changed.map(({ inst }) => ({ artifactId: inst.artifactId, version: inst.baseVersion })) }));
+    } catch (e) {
+      if (!(e instanceof OfflineError)) throw e;
+      // Offline: hold git's version (editing) instead of reverting it; `tether done` pushes later.
+      for (const { inst } of changed) this.db.update(inst.instanceId, { mode: 'editing', lastError: 'git changed this file while offline; run `tether done` to publish it' });
+      return { published: 0, offline: true };
+    }
+    let published = 0;
+    for (const [k, { inst, local }] of changed.entries()) {
+      const r = results[k];
+      const name = path.basename(inst.path);
+      if (r.status === 'gone' || r.state?.deleted || r.folderDeleted) {
+        this.orphan(inst, r.reason ?? 'deleted');
+        continue;
+      }
+      if (r.role === 'viewer') {
+        this.db.update(inst.instanceId, { gitMode: 'keep', role: 'viewer' });
+        continue; // reverted by the normal pass
+      }
+      const conflict = () => {
+        this.db.update(inst.instanceId, { mode: 'editing', lastError: 'conflict: git changed this file and Tether has a newer version; run `tether done` to resolve' });
+        this.log(`${inst.path}: git changed it but Tether also has a newer version; left in editing mode`);
+        this.notify({ kind: 'conflict', level: 'warn', title: 'Merge conflict (git and Tether)', body: `${name}: git changed it, but someone also pushed a newer version to Tether. Git's version is kept and the file is in editing mode; run "tether done" to choose.`, short: name, artifactId: inst.artifactId });
+      };
+      if (r.status === 'changed') {
+        conflict();
+        continue;
+      }
+      try {
+        await this.api.uploadBlobs([{ sha256: local.hash, bytes: local.canonical }]);
+        this.cache.put(local.hash, local.canonical);
+        const c = await this.api.call('POST', `/artifacts/${inst.artifactId}/commit`, { baseVersion: inst.baseVersion, change: { blob: local.hash, size: local.canonical.length } });
+        this.db.update(inst.instanceId, { baseVersion: c.version, remoteVersion: c.version, baseHash: local.hash, size: local.size, mtimeMs: local.mtimeMs, ...styleOf(local), lastError: null });
+        this.log(`${inst.path}: published git's version as v${c.version}`);
+        this.notify({ kind: 'git-published', level: 'info', title: "Published git's changes", body: `${name} is now v${c.version} for everyone who has it.`, short: name, artifactId: inst.artifactId });
+        published++;
+      } catch (e) {
+        if (e instanceof ApiError && e.status === 409) conflict();
+        else if (e instanceof ApiError) {
+          this.db.update(inst.instanceId, { mode: 'editing', lastError: `could not publish git's version: ${e.message}` });
+          this.notify({ kind: 'push-failed', level: 'error', title: 'Push failed', body: `${name}: ${e.message}. Git's version is kept in editing mode.`, short: name, artifactId: inst.artifactId });
+        } else throw e;
+      }
+    }
+    return { published };
+  }
+
+  // ---------- realtime editing ----------
+
+  /** Files this client is editing live (every save is pushed). */
+  realtimeInstances() {
+    return this.db.all().filter((i) => i.realtime && i.mode === 'editing' && i.kind === 'file');
+  }
+
+  /** True while anything held here is being edited live, so the daemon checks more often. */
+  get realtimeActive() {
+    return this.db.all().some((i) => (i.realtime && i.mode === 'editing') || (i.remoteRealtime && i.mode !== 'orphaned'));
+  }
+
+  async releaseRealtime(inst) {
+    this.db.update(inst.instanceId, { realtime: false });
+    await this.api.call('POST', `/artifacts/${inst.artifactId}/realtime`, { action: 'stop' }).catch(() => {});
+  }
+
+  /**
+   * Pushes live edits: renews the session, applies incoming versions when there is no local
+   * change, pushes local changes when the server has not moved, and pauses on a conflict.
+   */
+  async syncRealtime() {
+    const rts = this.realtimeInstances().filter((i) => !i.detached);
+    if (!rts.length) return;
+    let results;
+    try {
+      ({ results } = await this.api.call('POST', '/sync/check', { items: rts.map((i) => ({ artifactId: i.artifactId, version: i.baseVersion, realtime: true })) }));
+    } catch (e) {
+      if (e instanceof OfflineError) return (this.offline = e.message);
+      throw e;
+    }
+    for (const [k, inst] of rts.entries()) {
+      const r = results[k];
+      const cur = this.db.get(inst.instanceId);
+      if (!cur || cur.mode !== 'editing' || !cur.realtime) continue;
+      if (r.status === 'gone' || r.state?.deleted || r.folderDeleted) {
+        this.orphan(cur, r.reason ?? 'deleted');
+        continue;
+      }
+      if (!r.realtime?.mine) {
+        const why = r.role === 'viewer' ? 'you are no longer an editor' : r.realtime ? `taken over by ${r.realtime.email}` : 'it ended';
+        this.db.update(cur.instanceId, { realtime: false, lastError: r.role === 'viewer' ? null : `realtime session lost (${why}); still editing, run \`tether done\` to push` });
+        this.log(`${cur.path}: realtime session lost (${why})`);
+        this.notify({ kind: 'realtime-lost', level: 'warn', title: 'Live editing stopped', body: `${path.basename(cur.path)}: your realtime session ${why}. Your changes are kept; run "tether done" to push them.`, short: path.basename(cur.path), artifactId: cur.artifactId });
+        continue;
+      }
+      try {
+        const local = readLocal(cur.path, cur.eolMode);
+        if (r.status === 'changed') {
+          if (!local || local.hash === cur.baseHash) {
+            await this.ensureBlobs([{ artifactId: cur.artifactId, version: r.state.version, sha: r.state.blob }]);
+            this.applyIncoming(cur, r.state);
+          } else {
+            if (!cur.lastError?.startsWith('conflict')) {
+              this.log(`${cur.path}: someone else pushed while you were editing live; live pushing paused, run \`tether done\` to resolve`);
+              this.notify({ kind: 'conflict', level: 'warn', title: 'Merge conflict', body: `${path.basename(cur.path)}: someone else pushed while you were editing live. Live pushing is paused; run "tether done" to choose what to keep.`, short: path.basename(cur.path), artifactId: cur.artifactId });
+            }
+            this.db.update(cur.instanceId, { lastError: 'conflict: the server changed; run `tether done` to resolve' });
+          }
+          continue;
+        }
+        if (!local || local.hash === cur.baseHash) continue;
+        await this.api.uploadBlobs([{ sha256: local.hash, bytes: local.canonical }]);
+        this.cache.put(local.hash, local.canonical);
+        try {
+          const c = await this.api.call('POST', `/artifacts/${cur.artifactId}/commit`, { baseVersion: cur.baseVersion, change: { blob: local.hash, size: local.canonical.length } });
+          this.db.update(cur.instanceId, { baseVersion: c.version, remoteVersion: c.version, baseHash: local.hash, size: local.size, mtimeMs: local.mtimeMs, ...styleOf(local), lastError: null });
+          this.log(`${cur.path}: pushed v${c.version} (realtime)`);
+        } catch (e) {
+          if (!(e instanceof ApiError && e.status === 409)) throw e;
+          this.db.update(cur.instanceId, { lastError: 'conflict: the server changed; run `tether done` to resolve' });
+        }
+      } catch (e) {
+        if (!(e instanceof LockedError)) throw e;
+        this.db.update(cur.instanceId, { lastError: e.message });
+      }
+    }
   }
 
   /** Refresh path and file ID of every tracked instance (DESIGN §5). */
@@ -149,7 +370,11 @@ export class Engine {
       this.log(`${inst.path}: folder deleted locally; no longer managed here`);
       return;
     }
-    if (inst.mode === 'editing') {
+    if (inst.gitMode === 'follow' && inst.mode === 'normal' && !inst.folderInstanceId) {
+      // Usually a branch switch: keep tracking and pick the file up again when git restores it.
+      this.db.update(inst.instanceId, { detached: true, missingSince: null });
+      this.log(`${inst.path}: removed (by git?); waiting for git to bring it back`);
+    } else if (inst.mode === 'editing') {
       this.db.update(inst.instanceId, { detached: true, missingSince: null });
       this.log(`${inst.path}: deleted while editing; resolve with \`tether done\``);
     } else if (inst.folderInstanceId) {
@@ -164,7 +389,9 @@ export class Engine {
   orphan(inst, reason) {
     const targets = inst.kind === 'folder' ? [inst, ...this.db.childrenOf(inst.instanceId)] : [inst];
     for (const t of targets) this.db.update(t.instanceId, { mode: 'orphaned', orphanReason: reason });
-    this.log(`${inst.path}: ${reason === 'revoked' ? 'access revoked' : reason === 'deleted' ? 'deleted on the server' : 'removed from the server'}; file kept, no longer tracked`);
+    const what = reason === 'revoked' ? 'access revoked' : reason === 'deleted' ? 'deleted on the server' : 'removed from the server';
+    this.log(`${inst.path}: ${what}; file kept, no longer tracked`);
+    this.notify({ kind: 'orphaned', level: 'warn', title: 'No longer synced', body: `${path.basename(inst.path)}: ${what}. Your copy stays on disk but Tether no longer keeps it up to date.`, short: path.basename(inst.path) });
   }
 
   /** One batched call for all instances (DESIGN §6.1 step 2). */
@@ -181,6 +408,7 @@ export class Engine {
     } catch (e) {
       if (e instanceof OfflineError || (e instanceof ApiError && e.status === 401)) {
         this.offline = e.message;
+        if (e instanceof ApiError) this.notify({ kind: 'auth', level: 'error', key: 'auth', cooldownMs: 6 * 3600 * 1000, title: 'Tether needs you to sign in', body: `${e.message}. Until then nothing syncs.` });
         return;
       }
       throw e;
@@ -193,10 +421,19 @@ export class Engine {
       if (!cur || cur.mode === 'orphaned') return;
       if (r.status === 'gone') return this.orphan(cur, r.reason);
       if (r.folderDeleted || r.state?.deleted) return this.orphan(cur, 'deleted');
-      const patch = { role: r.role, canDelete: r.canDelete, remoteVersion: r.version };
+      const patch = {
+        role: r.role, canDelete: r.canDelete, remoteVersion: r.version,
+        remoteRealtime: r.realtime && !r.realtime.mine ? JSON.stringify({ email: r.realtime.email, since: r.realtime.since }) : null,
+      };
       if (cur.role && cur.role !== 'viewer' && r.role === 'viewer' && cur.mode === 'editing') {
         patch.mode = 'normal';
+        patch.realtime = false;
         this.log(`${cur.path}: you are now a viewer; editing ended and local changes will be reverted`);
+        this.notify({ kind: 'demoted', level: 'warn', title: 'You are now a viewer', body: `${path.basename(cur.path)}: your editor access was removed, so your unpushed changes are being reverted.`, short: path.basename(cur.path), artifactId: cur.artifactId });
+      }
+      if (cur.gitMode === 'follow' && r.role === 'viewer') {
+        patch.gitMode = 'keep';
+        this.notify({ kind: 'demoted', level: 'warn', title: 'Git follow mode turned off', body: `${path.basename(cur.path)}: you are no longer an editor, so git's changes to it will be reverted.`, short: path.basename(cur.path), artifactId: cur.artifactId });
       }
       const now = this.db.update(cur.instanceId, patch);
       if (r.status !== 'changed') return;
@@ -219,7 +456,7 @@ export class Engine {
       if (e instanceof OfflineError) return (this.offline = e.message);
       throw e;
     }
-    for (const { inst, state } of incoming) this.applyIncoming(inst, state);
+    for (const { inst, state } of incoming) if (!this.isGitBusy(inst)) this.applyIncoming(inst, state);
     for (const { folder, child } of newChildren) {
       this.db.insert({
         instanceId: newInstanceId(), artifactId: child.artifactId, kind: 'file', folderInstanceId: folder.instanceId,
@@ -246,15 +483,29 @@ export class Engine {
         this.log(`${inst.path} -> ${to}: moved by the server`);
       }
       const patch = { path: p, relPath: state.relPath, baseVersion: state.version, baseHash: state.blob, eolMode: state.eol, exec: state.exec, lastError: null };
-      if (state.blob !== inst.baseHash || !this.matchesBase(inst, p)) {
+      const localEdit = !this.matchesBase(inst, p) && readLocal(p, inst.eolMode)?.hash !== state.blob;
+      if (state.blob !== inst.baseHash || localEdit) {
         Object.assign(patch, this.writeInstance(inst, p, state.blob, state.eol, state.exec));
-        this.log(`${p}: updated to version ${state.version}`);
+        this.log(`${p}: updated to version ${state.version}${localEdit ? ' (local change replaced)' : ''}`);
+        if (localEdit) {
+          const name = path.basename(p);
+          this.notify({
+            kind: 'revert', level: 'info', short: name, artifactId: inst.artifactId,
+            title: inst.gitMode === 'keep' ? 'Tether undid a git change' : 'Tether undid your change',
+            body: `${name} is managed by Tether, so your local change was replaced with the shared version (v${state.version}). Run "tether edit ${name}" to change it.`,
+          });
+        }
       }
       this.db.update(inst.instanceId, patch);
     } catch (e) {
       if (!(e instanceof LockedError)) throw e;
-      this.db.update(inst.instanceId, { lastError: e.message });
+      this.lockedNotice(inst, e);
     }
+  }
+
+  lockedNotice(inst, e) {
+    if (!inst.lastError) this.notify({ kind: 'locked', level: 'warn', key: `locked:${inst.instanceId}`, cooldownMs: 3600 * 1000, title: 'File in use', body: `${path.basename(inst.path)} is open in another program, so Tether cannot update it yet. It will retry automatically.`, short: path.basename(inst.path) });
+    this.db.update(inst.instanceId, { lastError: e.message });
   }
 
   /** If `to` is occupied by something that isn't this instance, move it aside (keep both). */
@@ -287,6 +538,7 @@ export class Engine {
     }
     for (const inst of this.db.all()) {
       if (inst.mode !== 'normal' || inst.kind !== 'file' || inst.detached) continue;
+      if (this.isGitBusy(inst)) continue; // never rewrite files under a running git operation
       try {
         if (inst.needsRestore) {
           if (this.cache.has(inst.baseHash)) this.restore(inst);
@@ -307,9 +559,15 @@ export class Engine {
         if (!this.cache.has(cur.baseHash)) continue; // offline and not cached yet
         this.db.update(cur.instanceId, { ...this.writeInstance(cur, cur.path, cur.baseHash), lastError: null });
         this.log(`${cur.path}: local change reverted (use \`tether edit\` to change it)`);
+        const byGit = cur.gitMode === 'keep';
+        this.notify({
+          kind: 'revert', level: 'info', short: path.basename(cur.path), artifactId: cur.artifactId,
+          title: byGit ? 'Tether undid a git change' : 'Tether undid your change',
+          body: `${path.basename(cur.path)} is managed by Tether, so it was put back to the shared version. Run "tether edit ${path.basename(cur.path)}" to change it${byGit ? ', or "tether git <path> --mode follow" to accept git updates' : ''}.`,
+        });
       } catch (e) {
         if (!(e instanceof LockedError)) throw e;
-        this.db.update(inst.instanceId, { lastError: e.message });
+        this.lockedNotice(inst, e);
       }
     }
   }
@@ -375,7 +633,14 @@ export class Engine {
   }
 
   /** `tether manage <path> --repo <repo>`: upload; the caller becomes the owner. */
-  async manage({ path: target, repo: repoRef, eol }) {
+  /** `tether manage`, then apply the git mode chosen for a path inside a git repository. */
+  async manage({ gitMode, ...opts }) {
+    const r = await this.manageCore(opts);
+    if (gitMode) this.applyGitMode(this.instanceAt(r.path), gitMode);
+    return r;
+  }
+
+  async manageCore({ path: target, repo: repoRef, eol }) {
     const abs = canonicalPath(path.resolve(target));
     const st = statOrNull(abs);
     if (!st) throw new UserError(`${abs} does not exist`);
@@ -458,11 +723,27 @@ export class Engine {
   }
 
   /** `tether pull <shareId> [dest]`. Never overwrites existing user files. */
-  async pull({ shareId, dest, cwd }) {
+  /** `tether pull`; with peek, only report where it would go and the caller's role. */
+  async pull({ gitMode, peek, ...opts }) {
+    if (peek) {
+      const r = await this.api.call('POST', '/pull', { shareId: opts.shareId, peek: true });
+      return { role: r.role, kind: r.artifact.kind, path: this.pullTarget(r.artifact, opts) };
+    }
+    const r = await this.pullCore(opts, gitMode);
+    if (gitMode) this.applyGitMode(this.instanceAt(r.path), gitMode);
+    return r;
+  }
+
+  pullTarget(a, { dest, cwd }) {
+    const target = path.resolve(cwd, dest ?? a.name);
+    return dest && statOrNull(target)?.isDirectory() && a.kind === 'file' ? path.join(target, a.name) : target;
+  }
+
+  async pullCore({ shareId, dest, cwd }, gitMode) {
     const r = await this.api.call('POST', '/pull', { shareId });
     const a = r.artifact;
-    let target = path.resolve(cwd, dest ?? a.name);
-    if (dest && statOrNull(target)?.isDirectory() && a.kind === 'file') target = path.join(target, a.name);
+    if (gitMode === 'follow' && r.role === 'viewer') throw new UserError('git follow mode needs editor access; you are a viewer (use --git keep)');
+    const target = this.pullTarget(a, { dest, cwd });
     if (this.instanceAt(target)) throw new UserError(`${target} is already a managed copy`);
     const base = { repoId: a.repoId, role: r.role, canDelete: r.canDelete };
 
@@ -528,14 +809,54 @@ export class Engine {
     return changed;
   }
 
-  edit({ path: p }) {
+  /**
+   * `tether edit [--realtime]`. Realtime claims a live session per file (editors only, one
+   * holder per file). A plain edit warns about files someone else is editing live.
+   */
+  async edit({ path: p, realtime = false }) {
     const ts = this.targets(p);
     const unmanaged = ts.filter((i) => i.mode === 'unmanaged' && !i.detached);
     if (unmanaged.length === ts.length) throw new UserError('these files are unmanaged; use `tether track` first');
-    return { changed: this.setMode(p, 'editing', ['normal']) };
+    const files = ts.filter((i) => i.kind === 'file' && ['normal', 'editing'].includes(i.mode) && !i.detached);
+    if (realtime) {
+      if (!files.length) throw new UserError('nothing here to edit');
+      const viewerOf = files.find((i) => i.role === 'viewer');
+      if (viewerOf) throw new UserError(`realtime editing needs editor access; you are a viewer of ${viewerOf.path}`);
+      const claimed = [];
+      for (const f of files) {
+        try {
+          await this.api.call('POST', `/artifacts/${f.artifactId}/realtime`, { action: 'start' });
+          claimed.push(f);
+        } catch (e) {
+          for (const c of claimed) await this.releaseRealtime(c);
+          if (e instanceof ApiError && e.status === 409 && e.body?.realtime) {
+            const s = e.body.realtime;
+            throw new UserError(`${f.path} is already being edited in realtime by ${s.email} (since ${new Date(s.since).toLocaleTimeString()}).\nYou can still run \`tether edit\` without --realtime, but expect merge conflicts.`);
+          }
+          throw e;
+        }
+      }
+      this.setMode(p, 'editing', ['normal', 'editing']);
+      for (const f of files) this.db.update(f.instanceId, { mode: 'editing', realtime: true, lastError: null });
+      return { changed: files.map((f) => f.path), realtime: true };
+    }
+    const changed = this.setMode(p, 'editing', ['normal']);
+    const warnings = [];
+    if (files.length) {
+      try {
+        const { results } = await this.api.call('POST', '/sync/check', { items: files.map((i) => ({ artifactId: i.artifactId, version: i.baseVersion })) });
+        results.forEach((r, k) => {
+          if (r.realtime && !r.realtime.mine) warnings.push({ path: files[k].path, email: r.realtime.email, since: r.realtime.since });
+        });
+      } catch (e) {
+        if (!(e instanceof OfflineError)) throw e;
+      }
+    }
+    return { changed, warnings };
   }
 
-  unmanage({ path: p }) {
+  async unmanage({ path: p }) {
+    for (const i of this.targets(p).filter((x) => x.realtime)) await this.releaseRealtime(i);
     return { changed: this.setMode(p, 'unmanaged', ['normal', 'editing']) };
   }
 
@@ -621,6 +942,8 @@ export class Engine {
     for (const f of this.targets(p).filter((i) => i.kind === 'folder' && i.mode === from)) {
       if (!this.db.childrenOf(f.instanceId).some((c) => c.mode === from && !c.detached)) this.db.update(f.instanceId, { mode: 'normal' });
     }
+    // Finished live sessions end on the server too.
+    for (const i of this.db.all().filter((x) => x.realtime && x.mode !== 'editing')) await this.releaseRealtime(i);
     await this.tick();
     return { results: out };
   }
@@ -742,6 +1065,9 @@ export class Engine {
         }
       }
       if (i.orphanReason) flags.push(i.orphanReason);
+      if (i.realtime && i.mode === 'editing') flags.push('realtime: your saves are pushed live');
+      if (i.gitMode) flags.push(`git: ${i.gitMode}`);
+      if (i.remoteRealtime && i.mode !== 'orphaned') flags.push(`realtime edits by ${JSON.parse(i.remoteRealtime).email}`);
       return {
         instanceId: i.instanceId, artifactId: i.artifactId, kind: i.kind, path: i.path, relPath: i.relPath, mode: i.mode, role: i.role,
         version: i.baseVersion, folderInstanceId: i.folderInstanceId, flags,

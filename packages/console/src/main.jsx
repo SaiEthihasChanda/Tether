@@ -357,7 +357,7 @@ function Artifact({ id }) {
   const a = useLoad(() => A.api('GET', `/artifacts/${id}`), [id]);
   if (a.error) return <ErrorNote error={a.error} />;
   if (!a.data) return <p className="muted">Loading…</p>;
-  const { artifact: x, role, canDelete, children, folder } = a.data;
+  const { artifact: x, role, canDelete, children, folder, realtime } = a.data;
   const isOwner = role === 'owner';
   return (
     <>
@@ -370,6 +370,13 @@ function Artifact({ id }) {
         {x.kind} · v{x.version} · you are <span className={`chip ${role}`}>{role}</span>
         {x.kind === 'file' && ` · ${bytes(x.size)} · eol ${x.eol}`}
       </p>
+      {realtime && (
+        <p className="live" role="status">
+          <span className="dot" aria-hidden="true" /> Being edited live by {realtime.mine ? 'you' : realtime.email} since {new Date(realtime.since).toLocaleTimeString()}
+          {!realtime.mine && ' — other edits may conflict.'}
+          {role === 'owner' && !realtime.mine && <Action className="ghost small" label="End session" confirm={`End ${realtime.email}'s live session?`} onRun={() => A.api('POST', `/artifacts/${id}/realtime`, { action: 'stop', force: true }).then(a.reload)} />}
+        </p>
+      )}
       <div className="row">
         {canDelete && !x.deleted && <Action className="danger" label="Delete for everyone" confirm="Delete for everyone? Copies stay on disk but stop syncing. The owner can restore it." onRun={() => A.api('POST', `/artifacts/${id}/delete`).then(a.reload)} />}
         {isOwner && x.deleted && x.kind === 'folder' && <Action label="Restore folder" onRun={() => A.api('POST', `/artifacts/${id}/restore`).then(a.reload)} />}

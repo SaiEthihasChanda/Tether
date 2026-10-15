@@ -16,7 +16,8 @@ export class Machine {
     this.name = name;
     this.home = fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), `tether-${name}-home-`)));
     this.dir = fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), `tether-${name}-work-`)));
-    this.env = { ...process.env, TETHER_HOME: this.home, TETHER_SERVER: serverUrl };
+    // Notifications go to a file in tests instead of popping up on the desktop.
+    this.env = { ...process.env, TETHER_HOME: this.home, TETHER_SERVER: serverUrl, TETHER_NOTIFY_LOG: path.join(this.home, 'notify.log') };
     if (tracker) this.env.TETHER_TRACKER = tracker;
     fs.writeFileSync(path.join(this.home, 'config.json'), JSON.stringify({ server: serverUrl, tickSeconds, graceMs, scanRoots: [this.dir] }));
   }
@@ -75,6 +76,15 @@ export class Machine {
 
   async status(p) {
     return JSON.parse((await this.run(['status', '--json', ...(p ? [p] : [])])).stdout);
+  }
+
+  /** Notifications shown so far: [{ title, body, url, level }]. */
+  notifications() {
+    try {
+      return fs.readFileSync(path.join(this.home, 'notify.log'), 'utf8').trim().split('\n').filter(Boolean).map((l) => JSON.parse(l));
+    } catch {
+      return [];
+    }
   }
 
   async log() {

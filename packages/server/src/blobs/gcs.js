@@ -46,6 +46,11 @@ export class GcsBlobStore {
     return size;
   }
 
+  async read(sha) {
+    const [bytes] = await this.file(sha).download();
+    return bytes;
+  }
+
   async uploadTarget(sha, size) {
     const headers = { 'x-goog-if-generation-match': '0', 'x-goog-content-length-range': `0,${Math.min(size, this.maxFileSize)}` };
     const [url] = await this.file(sha).getSignedUrl({

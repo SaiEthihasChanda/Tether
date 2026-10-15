@@ -121,10 +121,30 @@ export async function runDaemon() {
 
   // ---- watchers: parent folders of files, and managed folders (recursive) ----
   const watchers = new Map();
+  let gitTimer = null;
+  /** git just did something in a repository with managed files: look once it settles. */
+  function gitPassSoon() {
+    clearTimeout(gitTimer);
+    gitTimer = setTimeout(async () => {
+      gitTimer = null;
+      try {
+        await engine.locked(async () => {
+          engine.busyCache = new Map();
+          await engine.locateAll();
+          await engine.gitPass();
+          await engine.enforceLocal();
+        });
+      } catch (e) {
+        log(`git pass failed: ${e.message}`);
+      }
+    }, 600);
+  }
   function refreshWatchers() {
     const want = new Map();
     for (const i of db.all()) {
-      if (i.mode === 'orphaned' || i.detached) continue;
+      if (i.mode === 'orphaned') continue;
+      if (i.gitDir && !want.has(i.gitDir)) want.set(i.gitDir, 'git');
+      if (i.detached) continue;
       if (i.kind === 'folder') want.set(i.path, true);
       else if (!i.folderInstanceId) want.set(path.dirname(i.path), false);
     }
@@ -134,13 +154,15 @@ export async function runDaemon() {
         watchers.delete(dir);
       }
     }
-    for (const [dir, recursive] of want) {
+    for (const [dir, kind] of want) {
       if (watchers.has(dir)) continue;
       try {
-        const w = fs.watch(dir, { recursive, persistent: false }, () => {
-          quickPass(250);
-          realtimePass();
-        });
+        const w = kind === 'git'
+          ? fs.watch(dir, { persistent: false }, () => gitPassSoon())
+          : fs.watch(dir, { recursive: kind, persistent: false }, () => {
+            quickPass(250);
+            realtimePass();
+          });
         w.on('error', () => {
           w.close();
           watchers.delete(dir);
@@ -287,11 +309,16 @@ export async function runDaemon() {
     },
   };
 
+  // Commands that change what is managed: start watching new folders and repositories at once.
+  const CHANGES_WATCHED = new Set(['manage', 'add', 'pull', 'edit', 'unmanage', 'git.mode', 'resolve', 'locate']);
+
   async function handle(method, params) {
     const h = handlers[method];
     if (!h) throw new UserError(`unknown command ${method}`);
     try {
-      return await h(params);
+      const result = await h(params);
+      if (CHANGES_WATCHED.has(method)) refreshWatchers();
+      return result;
     } catch (e) {
       if (e instanceof ApiError || e instanceof UserError) throw e;
       if (e.name === 'OfflineError') throw e;
@@ -311,6 +338,8 @@ export async function runDaemon() {
     clearTimeout(quickTimer);
     clearTimeout(realtimeTimer);
     clearInterval(updateTimer);
+    clearInterval(repoTimer);
+    clearTimeout(gitTimer);
     for (const w of watchers.values()) w.close();
     server.close();
     engine.locked(() => db.close()).finally(() => {
@@ -322,7 +351,11 @@ export async function runDaemon() {
   process.on('SIGINT', () => shutdown(0));
   process.on('SIGTERM', () => shutdown(0));
 
-  await engine.locked(() => engine.syncGitHooks()).catch((e) => log(`git hooks: ${e.message}`));
+  await engine.locked(() => {
+    engine.cleanupLegacyHooks();
+    engine.detectNewRepos();
+  }).catch((e) => log(`git setup: ${e.message}`));
+  const repoTimer = setInterval(() => engine.locked(() => engine.detectNewRepos()).catch(() => {}), 60 * 60 * 1000);
   const updateTimer = setInterval(checkForUpdate, UPDATE_CHECK_MS);
   setTimeout(checkForUpdate, 5000);
   await runTick();

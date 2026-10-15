@@ -14,15 +14,17 @@ export class ApiError extends Error {
   }
 }
 
-async function raw(method, path, body, token) {
+async function request(method, path, body, token, raw = false) {
   const res = await fetch('/v1' + path, {
     method,
     headers: { 'content-type': 'application/json', ...(token ? { authorization: `Bearer ${token}` } : {}) },
     body: body === undefined ? undefined : JSON.stringify(body),
   });
-  const json = await res.json().catch(() => ({}));
-  if (!res.ok) throw new ApiError(res.status, json.error);
-  return json;
+  if (!res.ok) {
+    const json = await res.json().catch(() => ({}));
+    throw new ApiError(res.status, json.error);
+  }
+  return raw ? res.arrayBuffer() : res.json().catch(() => ({}));
 }
 
 const store = {
@@ -44,9 +46,9 @@ const store = {
 };
 
 const FIREBASE_MESSAGES = {
-  'auth/invalid-credential': 'Wrong email or password.',
-  'auth/wrong-password': 'Wrong email or password.',
-  'auth/user-not-found': 'Wrong email or password.',
+  'auth/invalid-credential': 'Incorrect email or password.',
+  'auth/wrong-password': 'Incorrect email or password.',
+  'auth/user-not-found': 'Incorrect email or password.',
   'auth/email-already-in-use': 'An account with that email already exists.',
   'auth/weak-password': 'Password must be at least 6 characters.',
   'auth/invalid-email': 'Enter a valid email address.',
@@ -57,7 +59,7 @@ const friendly = (e) => new ApiError(400, { message: FIREBASE_MESSAGES[e.code] ?
 
 async function init() {
   if (mode) return mode;
-  mode = await raw('GET', '/config');
+  mode = await request('GET', '/config');
   if (mode.auth === 'firebase') {
     const [{ initializeApp }, sdk] = await Promise.all([import('firebase/app'), import('firebase/auth')]);
     const app = initializeApp({ apiKey: mode.apiKey, authDomain: mode.authDomain, projectId: mode.projectId });
@@ -85,7 +87,7 @@ export async function restore() {
   const rt = store.get();
   if (!rt) return null;
   try {
-    const r = await raw('POST', '/auth/refresh', { refreshToken: rt });
+    const r = await request('POST', '/auth/refresh', { refreshToken: rt });
     accessToken = r.accessToken;
     return r.user;
   } catch {
@@ -103,7 +105,7 @@ export async function login(email, password) {
     }
     return api('GET', '/me');
   }
-  const t = await raw('POST', '/auth/login', { email, password });
+  const t = await request('POST', '/auth/login', { email, password });
   accessToken = t.accessToken;
   store.set(t.refreshToken);
   return t.user;
@@ -119,7 +121,7 @@ export async function signup(email, password) {
     }
     return api('GET', '/me');
   }
-  const t = await raw('POST', '/auth/signup', { email, password });
+  const t = await request('POST', '/auth/signup', { email, password });
   accessToken = t.accessToken;
   store.set(t.refreshToken);
   return t.user;
@@ -138,23 +140,28 @@ export async function resetPassword(email) {
 export async function logout() {
   if (fb) return fb.sdk.signOut(fb.auth);
   const rt = store.get();
-  if (rt) await raw('POST', '/auth/logout', { refreshToken: rt }).catch(() => {});
+  if (rt) await request('POST', '/auth/logout', { refreshToken: rt }).catch(() => {});
   store.set(null);
   accessToken = null;
 }
 
-export async function api(method, path, body) {
+async function authed(method, path, body, raw) {
   if (fb) {
     const u = fb.auth.currentUser;
     if (!u) throw new ApiError(401, { message: 'not signed in' });
-    return raw(method, path, body, await u.getIdToken());
+    return request(method, path, body, await u.getIdToken(), raw);
   }
   try {
-    return await raw(method, path, body, accessToken);
+    return await request(method, path, body, accessToken, raw);
   } catch (e) {
     const rt = store.get();
     if (e.status !== 401 || !rt) throw e;
-    accessToken = (await raw('POST', '/auth/refresh', { refreshToken: rt })).accessToken;
-    return raw(method, path, body, accessToken);
+    accessToken = (await request('POST', '/auth/refresh', { refreshToken: rt })).accessToken;
+    return request(method, path, body, accessToken, raw);
   }
 }
+
+export const api = (method, path, body) => authed(method, path, body, false);
+
+/** Raw bytes of a file version (for previews and downloads). */
+export const content = (artifactId, version) => authed('GET', `/artifacts/${artifactId}/content${version ? `?version=${version}` : ''}`, undefined, true);

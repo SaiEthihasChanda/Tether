@@ -20,6 +20,8 @@ export function view(a) {
     deleted: !!a.deleted,
     eol: a.eol ?? 'auto',
     exec: !!a.exec,
+    gitCommit: a.gitCommit ?? null, // set when this version was published from a git commit
+    updatedAt: a.updatedAt ?? a.createdAt ?? null,
   };
 }
 
@@ -289,11 +291,12 @@ export class TetherService {
   }
 
   snapshot(a) {
-    return { blob: a.blob ?? null, size: a.size ?? 0, relPath: a.relPath ?? null, deleted: !!a.deleted };
+    return { blob: a.blob ?? null, size: a.size ?? 0, relPath: a.relPath ?? null, deleted: !!a.deleted, gitCommit: a.gitCommit ?? null };
   }
 
   /** `tether add`: owner adds a new file to a folder artifact. */
-  async addChild(uid, folderId, { relPath, blob, size, eol, exec }) {
+  async addChild(uid, folderId, { relPath, blob, size, eol, exec, gitCommit }) {
+    if (gitCommit != null && !/^[0-9a-f]{40,64}$/.test(String(gitCommit))) throw badRequest('invalid git commit');
     const { artifact: folder } = await this.requireOwner(uid, folderId);
     if (folder.kind !== 'folder') throw badRequest('not a folder artifact');
     if (folder.deleted) throw badRequest('folder has been deleted');
@@ -314,6 +317,7 @@ export class TetherService {
       size: await this.checkBlob(blob, size),
       eol: this.checkEol(eol),
       exec: !!exec,
+      gitCommit: gitCommit ?? null,
     };
     await this.store.insertArtifacts([child]);
     await this.store.insertVersion({ ...this.snapshot(child), artifactId: child._id, version: 1, type: 'create', authorUid: uid, createdAt: now, basedOn: 0 });
@@ -432,6 +436,9 @@ export class TetherService {
       types.push('delete');
     }
     if (!types.length) return { version: a.currentVersion, unchanged: true };
+    if (change.gitCommit !== undefined && change.gitCommit !== null && !/^[0-9a-f]{40,64}$/.test(String(change.gitCommit))) throw badRequest('invalid git commit');
+    set.gitCommit = change.gitCommit ?? null;
+    set.updatedAt = new Date();
     if (!(await this.store.casArtifact(a._id, baseVersion, set))) {
       throw conflict('the artifact changed on the server', { current: view(await this.store.artifactById(a._id)) });
     }
@@ -449,7 +456,7 @@ export class TetherService {
     if (a.kind !== 'file') throw badRequest('roll back individual files inside a folder');
     const v = await this.store.version(a._id, Number(toVersion));
     if (!v) throw notFound(`version ${toVersion} not found`);
-    const set = { blob: v.blob, size: v.size, deleted: !!v.deleted };
+    const set = { blob: v.blob, size: v.size, deleted: !!v.deleted, gitCommit: null, updatedAt: new Date() };
     if (a.parentFolderId) {
       set.relPath = v.relPath;
       set.name = path.posix.basename(v.relPath);
@@ -577,6 +584,20 @@ export class TetherService {
   }
 
   /** Signed download URLs for (artifactId, version?) pairs the caller can read. */
+  /** File content for the console's preview (served by the API: browsers cannot read Storage directly). */
+  async content(uid, artifactId, version) {
+    const { artifact: a } = await this.access(uid, artifactId);
+    if (a.kind !== 'file') throw badRequest('folders have no content');
+    let sha = a.blob;
+    if (version !== undefined && Number(version) !== a.currentVersion) {
+      const v = await this.store.version(a._id, Number(version));
+      if (!v) throw notFound(`version ${version} not found`);
+      sha = v.blob;
+    }
+    if (!sha) throw notFound('this version has no content');
+    return { name: a.name, bytes: await this.blobs.read(sha) };
+  }
+
   async downloadUrls(uid, items) {
     const out = [];
     for (const { artifactId, version } of items ?? []) {

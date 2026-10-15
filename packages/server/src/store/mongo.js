@@ -84,7 +84,7 @@ export class MongoStore {
   }
   /** Atomically bump a folder's layout version; returns the new version. */
   async bumpVersion(id) {
-    const doc = await this.artifacts.findOneAndUpdate({ _id: id }, { $inc: { currentVersion: 1 } }, { returnDocument: 'after' });
+    const doc = await this.artifacts.findOneAndUpdate({ _id: id }, { $inc: { currentVersion: 1 }, $set: { updatedAt: new Date() } }, { returnDocument: 'after' });
     return doc.currentVersion;
   }
   deleteArtifacts(ids) { return this.artifacts.deleteMany({ _id: { $in: ids } }); }

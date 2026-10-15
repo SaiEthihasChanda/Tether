@@ -376,28 +376,46 @@ Behaviours the build had to settle where the design was silent:
 
 `tether update` checks npm for a newer `tether-sync`. It stops the daemon, which holds native files open on Windows, reinstalls into the same npm prefix, and restarts the daemon. A development checkout refuses to self-update. The daemon checks for updates once a day and `tether status` mentions when one is available.
 
-## 12c. Git repositories and notifications (2026-10-15)
+## 12c. Git repositories and notifications (2026-10-15, revised for 0.3.0)
 
-**Managed files inside a git repository.** `manage` and `pull` detect the repository and ask how Tether and git share the file. `--git` answers without the prompt, and a non-interactive run defaults to keep. Stored per instance as `gitMode`:
-- **keep:** Tether is the mirror. Git's changes are reverted, like any local edit, with a notification.
-- **skip:** not managed.
-- **follow** (editors and owners only):
-  - Hooks (`post-merge`, `post-checkout`, `post-rewrite`) tell the daemon over IPC that git changed files. A block is added per Tether profile, and existing hook content is kept.
-  - On that signal, git's version of each changed follow-mode file is pushed (base-version check as usual).
-  - If Tether also has a newer version, the file stays in editing mode with a notification, and `tether done` resolves it.
-  - Hooks are removed when no follow-mode files remain in the repo.
+**Choosing a mode.** `manage` and `pull` detect a surrounding git repository and ask:
+1. **keep:** Tether is the mirror.
+2. **skip:** don't manage the file.
+3. **follow:** git's changes are published to Tether. Editors and owners only.
 
-While git is mid-operation (`index.lock`, or a merge, rebase, cherry-pick or revert in progress), Tether writes nothing in that repository. When a merge or rebase finishes (busy changes to idle), follow-mode files are reconciled even without a hook.
+`--git keep|follow|skip` answers without the prompt; a non-interactive run defaults to keep. `tether git <path> --mode` changes it later. A managed file that later ends up inside a repository (`git init`, or moved into one) is switched to keep, with a notification. This is checked at startup and every hour.
 
-A follow-mode file that git removes, as on a branch switch, is kept and picked up again when git restores it. Switching between branches that hold different versions therefore publishes each version. That is the intended "git's version wins" behavior.
+**No hooks; the daemon decides by content.** The daemon watches each repository's git directory (`HEAD`, the index, refs, lock files) and re-checks shortly after git settles, and again on every sync.
+- A follow-mode file whose content now matches what git has committed (`HEAD`) or staged (the index) was changed by git. That version is published, tagged with the commit when it matches `HEAD`.
+- Any other change is a manual edit and is reverted, as in normal mode.
+- This covers `pull`, `merge`, `rebase`, `checkout`/`switch`, `restore`, `reset`, `stash`, `cherry-pick`, `revert` and `am`, including in GUI clients and repositories that use `core.hooksPath` or husky.
+- Nothing is written into the repository except git's own local configuration, described below.
 
-Demotion to viewer turns follow into keep.
+**Keep mode never blocks git.** A local *clean filter* is written into `.git/info/attributes` (never committed) together with `filter.tether-keep.clean`. It makes git read the kept file as exactly what git already has. After Tether writes the file, it re-stages it so git's size and time cache matches; this is a content no-op.
+- `git status` stays clean and `git add` stages nothing.
+- `pull`, `merge` and `checkout` go through even when they change the file.
+- git writes its own version and Tether puts the shared one back, with a notification.
 
-**Limit:** in keep mode, Tether's updates leave the file modified in git's eyes, so a later `git pull` that touches the file may refuse until the change is stashed or committed.
+**Teams in follow mode.**
+- **Versions from git wait for git.** A version published from a commit (`gitCommit`) is not written by teammates' clients until that commit is in their `HEAD`; the status shows "newer version arrives with your next git pull". Writing it first would make git refuse the pull that brings it. New files in follow-mode folders wait the same way. When the pull arrives, the client sees that Tether already has exactly that content and adopts it, with no conflict.
+- **Tether-only versions become an overlay.** A version that exists only in Tether, for example edited from a copy outside git, is applied as a hidden *overlay* through the same filter, so it never dirties the working tree. When git next changes the file, git's version wins and the overlay ends. `tether done` from inside a repository tags its push with the commit when the content is exactly git's.
 
-**Notifications.** The daemon shows desktop notifications: Windows toasts under the registered app ID `Tether.Sync`, or `notify-send` on Linux.
+**Conflicts, deletes and renames.**
+- If git changed a follow-mode file while Tether also moved on to different content, git's version is kept in editing mode, with a notification. `tether done` resolves it.
+- Nothing is rewritten while git is busy: `index.lock`, or a merge, rebase, cherry-pick or revert in progress.
+- A managed file that vanishes inside a repository is kept and waits, in both modes. This covers branch switches and `git clean`. The file is picked up again when git restores it.
+- Renames made in git are followed commit by commit, so a rename that was later edited is still recognised.
+- Files git adds to a follow-mode folder are published by the owner. For editors they are reported, since only owners can add files.
+- Deletions made in git are never published as deletes for everyone.
+
+**Git without PATH.** Git is looked up on PATH, then in Git for Windows' default locations and GitHub Desktop's bundled copy. Without any git executable, repositories are still detected by reading `.git`, but only keep mode is available.
+
+**Hooks from 0.2.0** are removed automatically on startup.
+
+**Notifications.**
+- **Mechanism:** Windows toasts under the app ID `Tether.Sync`. The daemon creates the Start-menu shortcut that carries this ID, without which Windows only files toasts in the Notification Center. On Linux, `notify-send`.
 - **Events:**
-  - reverted local or git changes
+  - reverted local or git changes, and replaced local changes
   - conflicts (live editing, or git with Tether)
   - failed pushes
   - lost live sessions
@@ -405,10 +423,12 @@ Demotion to viewer turns follow into keep.
   - revoked or deleted artifacts
   - files locked by other programs
   - sign-in expiry
+  - Tether-only overlays
+  - new files that only owners can add
   - failed sync passes
   - available updates
 - **Grouping:** events are grouped over 3 seconds ("(+2 more)"), and repeats are rate-limited.
-- **Clicking:** opens the artifact (or the console) in the browser.
+- **Clicking:** opens the artifact or the console.
 - **Setting:** `notifications` = `all` | `errors` | `off`.
 
 ## 13. Open questions

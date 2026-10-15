@@ -214,7 +214,7 @@ export class FirestoreStore {
     const ref = this.c('artifacts').doc(id);
     return this.db.runTransaction(async (tx) => {
       const v = (await tx.get(ref)).get('currentVersion') + 1;
-      tx.update(ref, { currentVersion: v });
+      tx.update(ref, { currentVersion: v, updatedAt: new Date() });
       return v;
     });
   }

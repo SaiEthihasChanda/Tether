@@ -113,6 +113,7 @@ async function chooseGitMode(target, flag, canFollow) {
   out(`${target} is inside the git repository ${repo.root}.`);
   out('How should Tether treat it when git changes it?');
   out("  [1] keep managing it: git's changes (pull, checkout, switch, merge) may get reverted to Tether's version");
+  out("      (git is told to ignore Tether's copy, so git status stays clean and pulls are not blocked)");
   out('  [2] do not let Tether manage it');
   if (canFollow) out("  [3] manage it, and after a git pull, checkout, switch or merge accept git's version and publish it to Tether");
   else out('  (option 3, accepting git\'s changes, needs editor access)');
@@ -243,6 +244,7 @@ export async function main(argv) {
     if (gitMode === 'skip') return out('not pulled');
     const r = await daemon('pull', { shareId, dest, cwd: process.cwd(), gitMode });
     out(`pulled ${r.path} (${r.kind}${r.kind === 'folder' ? `, ${r.files} files` : ''}, v${r.version}) as ${r.role}`);
+    if (r.note) out(`note: ${r.note}`);
   });
   program.command('status [path]').description('modes, pending changes, problems')
     .option('-v, --verbose', 'show every file and instance IDs')

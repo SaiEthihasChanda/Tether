@@ -34,13 +34,15 @@ const COLUMNS = {
   gitMode: 'TEXT', // inside a git repo: keep (Tether reverts git's changes) | follow (git's changes are published)
   gitRoot: 'TEXT',
   gitDir: 'TEXT',
-  gitHooks: 'TEXT',
+  gitHooks: 'TEXT', // unused since 0.2.1 (hooks were replaced by watching the git directory)
+  gitWaiting: 'INTEGER DEFAULT 0', // follow: a newer Tether version came from a git commit not pulled here yet
+  gitOverlay: 'INTEGER DEFAULT 0', // follow: holds a Tether-only version that git does not have (hidden from git)
   lastError: 'TEXT',
   createdAt: 'REAL',
   updatedAt: 'REAL',
 };
 
-const BOOL = new Set(['realtime', 'hasBom', 'exec', 'canDelete', 'detached', 'needsRestore']);
+const BOOL = new Set(['gitOverlay', 'gitWaiting', 'realtime', 'hasBom', 'exec', 'canDelete', 'detached', 'needsRestore']);
 
 export class LocalDb {
   constructor(file) {

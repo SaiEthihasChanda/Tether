@@ -48,11 +48,11 @@ tether config set notifications errors    # desktop notifications: all | errors 
 ```
 
 **Files inside git repositories.** When you `manage` or `pull` into a git repo, Tether asks how to share the file with git:
-1. **keep:** Tether stays the mirror, so git's changes may be reverted.
+1. **keep:** Tether stays the mirror. Git ignores Tether's copy, so `git status` stays clean and pulls are never blocked.
 2. **skip:** don't manage the file.
-3. **follow** (editors only): after a git pull, checkout, switch, merge or rebase, git's version is accepted and published to Tether. Git hooks are added to the repo for this.
+3. **follow** (editors only): whatever git puts in the file, whether from a pull, checkout, merge, rebase, reset or restore, is published to Tether. Teammates in follow mode get it through their own `git pull`.
 
-Use `--git keep|follow|skip` to skip the question. Change it later with `tether git <path> --mode`.
+Use `--git keep|follow|skip` to skip the question, and change it later with `tether git <path> --mode`. Nothing is added to the repository; DESIGN.md §12c has the details.
 
 **Notifications.** The daemon shows desktop notifications (Windows toasts, or `notify-send` on Linux) for:
 - reverted changes (grouped)
@@ -96,8 +96,8 @@ Local server settings are `TETHER_MONGO_URL`, `TETHER_PORT`, `TETHER_DATA_DIR`, 
 ## Tests
 
 ```sh
-npm test                 # 112 tests on the local backend (in-memory MongoDB), about 90 s
-npm run test:firebase    # the same 112 tests on Firestore + Firebase Auth emulators (needs Java)
+npm test                 # 121 tests on the local backend (in-memory MongoDB), about 90 s
+npm run test:firebase    # the same 121 tests on Firestore + Firebase Auth emulators (needs Java)
 node test/prod-smoke.mjs            # two real clients against production (temporary accounts, deleted afterwards)
 node test/prod-console-smoke.mjs    # console + browser login against production
 ```

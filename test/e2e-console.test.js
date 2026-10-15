@@ -1,4 +1,4 @@
-// Phase 6: the web console in a real browser (installed Edge/Chrome via playwright-core),
+// The web console in a real browser (installed Edge/Chrome via playwright-core),
 // including the `tether login` browser hand-off.
 import test, { before, after } from 'node:test';
 import assert from 'node:assert/strict';
@@ -17,9 +17,10 @@ const browserPath = [
   '/usr/bin/google-chrome',
   '/usr/bin/chromium',
 ].find((p) => fs.existsSync(p));
-const skip = !browserPath ? 'no Chrome/Edge installed' : !fs.existsSync(path.join(consoleDir, 'index.html')) ? 'console not built (npm run build -w @tether/console)' : false;
+const skip = !browserPath ? 'no Chrome/Edge installed' : !fs.existsSync(path.join(consoleDir, 'index.html')) ? 'console not built (npm run console:build)' : false;
 
 let srv, cli, browser, page;
+const shot = async (p, name, opts = {}) => shots && p.screenshot({ path: path.join(shots, `${name}.png`), fullPage: true, ...opts });
 
 before(async () => {
   if (skip) return;
@@ -27,7 +28,8 @@ before(async () => {
   srv = await startTestServer({ consoleDir });
   cli = await new Machine(srv.url, 'web').start();
   browser = await chromium.launch({ executablePath: browserPath, headless: true });
-  page = await browser.newPage();
+  page = await browser.newPage({ viewport: { width: 1280, height: 860 } });
+  page.on('dialog', (d) => d.accept());
 });
 after(async () => {
   await browser?.close();
@@ -37,14 +39,18 @@ after(async () => {
 
 test('sign up and create a repository', { skip }, async () => {
   await page.goto(srv.url);
+  await shot(page, 'signin');
   await page.getByRole('button', { name: 'Create an account' }).click();
   await page.getByLabel('Email').fill('web@example.com');
   await page.getByLabel('Password').fill('password123');
   await page.getByRole('button', { name: 'Create account' }).click();
-  await page.getByText('Your repositories').waitFor();
+  await page.getByRole('heading', { name: 'Your repositories' }).waitFor();
+  await shot(page, 'dashboard-empty');
+  await page.getByRole('link', { name: 'New repository' }).click();
   await page.getByLabel('Repository name').fill('docs');
+  await shot(page, 'new-repo');
   await page.getByRole('button', { name: 'Create repository' }).click();
-  await page.getByRole('link', { name: /docs/ }).waitFor();
+  await page.getByText('This repository is empty').waitFor();
 });
 
 test('tether login completes through the console', { skip }, async () => {
@@ -53,11 +59,10 @@ test('tether login completes through the console', { skip }, async () => {
   const waiting = cli.ipc('login.wait', { state });
   await page.goto(url);
   await page.getByText('Sign in the Tether CLI?').waitFor();
-  if (shots) await page.screenshot({ path: path.join(shots, 'cli-login.png') });
+  await shot(page, 'cli-login');
   await page.getByRole('button', { name: 'Authorize CLI' }).click();
   await page.getByText('Tether CLI signed in').waitFor();
-  const user = await waiting;
-  assert.equal(user.email, 'web@example.com');
+  assert.equal((await waiting).email, 'web@example.com');
   assert.match((await cli.run(['whoami'])).stdout, /web@example.com/);
 });
 
@@ -68,57 +73,88 @@ test('a forged callback with the wrong state is rejected', { skip }, async () =>
   assert.equal(res.status, 400);
 });
 
-test('artifacts, sharing and history in the console', { skip }, async () => {
+test('repository, file preview, sharing, and history', { skip }, async () => {
   const friend = await new TestUser(srv.url).signup('friend@example.com');
-  cli.write('guide.md', '# Guide\n');
+  cli.write('guide.md', '# Guide\n\nHow we work.\n');
   await cli.run(['manage', 'guide.md', '--repo', 'docs']);
+  cli.write('kit/README.md', '# kit\n');
+  cli.write('kit/src/app.js', 'console.log(1);\n');
+  cli.write('kit/logo.bin', '\u0000\u0001');
+  await cli.run(['manage', 'kit', '--repo', 'docs']);
   await cli.run(['edit', 'guide.md']);
-  cli.write('guide.md', '# Guide\n\nv2\n');
+  cli.write('guide.md', '# Guide\n\nHow we work, v2.\n');
   await cli.run(['done', 'guide.md']);
 
   await page.goto(srv.url);
-  await page.getByRole('link', { name: /docs/ }).click();
+  await page.getByRole('link', { name: /docs/ }).first().click();
+  await page.getByRole('link', { name: 'guide.md' }).waitFor();
+  await shot(page, 'repo');
+
+  // folder browser
+  await page.getByRole('link', { name: 'kit', exact: true }).click();
+  await page.getByRole('link', { name: 'src' }).click();
+  await page.getByRole('link', { name: 'app.js' }).waitFor();
+  await page.goBack();
+  await page.getByRole('link', { name: 'logo.bin' }).click();
+  await page.getByText('Binary file not shown.').waitFor();
+
+  // file view with line numbers
+  await page.goto(srv.url);
+  await page.getByRole('link', { name: /docs/ }).first().click();
   await page.getByRole('link', { name: 'guide.md' }).click();
-  await page.getByRole('heading', { name: 'Sharing' }).waitFor();
-  const shareId = (await page.locator('code.big').textContent()).trim();
+  const code = page.getByRole('table', { name: 'File content' });
+  await code.getByText('How we work, v2.').waitFor();
+  await shot(page, 'file');
 
-  await page.getByLabel('Editor email').fill('friend@example.com');
-  await page.getByRole('button', { name: 'Add editor' }).click();
-  await page.getByText('friend@example.com').waitFor();
-  const pulled = await friend.call('POST', '/pull', { shareId });
-  assert.equal(pulled.role, 'editor');
+  // sharing: add an editor, who can then pull as an editor
+  await page.getByRole('link', { name: 'Sharing' }).click();
+  const shareId = (await page.getByTestId('share-id').textContent()).trim();
+  await page.getByLabel('Email address to add').fill('friend@example.com');
+  await page.getByRole('button', { name: 'Add', exact: true }).click();
+  await page.getByRole('listitem', { name: 'friend@example.com' }).waitFor();
+  await shot(page, 'sharing');
+  assert.equal((await friend.call('POST', '/pull', { shareId })).role, 'editor');
 
-  await page.getByRole('row', { name: /v2/ }).waitFor();
-  if (shots) {
-    await page.screenshot({ path: path.join(shots, 'artifact.png'), fullPage: true });
-    await page.setViewportSize({ width: 390, height: 844 });
-    await page.screenshot({ path: path.join(shots, 'artifact-mobile.png'), fullPage: true });
-    await page.setViewportSize({ width: 1280, height: 800 });
-  }
-
-  page.once('dialog', (d) => d.accept());
-  await page.getByRole('button', { name: 'Restore this' }).click();
-  await page.getByRole('row', { name: /v3 rollback \(to v1\)/ }).waitFor();
+  // history: restore v1 for everyone
+  await page.getByRole('link', { name: /History/ }).click();
+  await page.getByRole('listitem', { name: 'v2 Updated content' }).waitFor();
+  await page.getByRole('listitem', { name: 'v1 Created' }).getByRole('button', { name: 'Restore' }).click();
+  await page.getByRole('listitem', { name: 'v3 Restored v1' }).waitFor();
+  await shot(page, 'history');
   await cli.sync();
-  assert.equal(cli.read('guide.md'), '# Guide\n');
+  assert.equal(cli.read('guide.md').replace(/\r\n/g, '\n'), '# Guide\n\nHow we work.\n');
 
-  page.once('dialog', (d) => d.accept());
+  // rotate the share ID
+  await page.getByRole('link', { name: 'Sharing' }).click();
   await page.getByRole('button', { name: 'Rotate' }).click();
-  await page.waitForFunction((old) => document.querySelector('code.big')?.textContent.trim() !== old, shareId);
+  await page.waitForFunction((old) => document.querySelector('[data-testid="share-id"]')?.textContent.trim() !== old, shareId);
+
+  if (shots) {
+    await page.setViewportSize({ width: 390, height: 844 });
+    await page.getByRole('link', { name: 'Code' }).click();
+    await shot(page, 'file-mobile');
+    await page.setViewportSize({ width: 1280, height: 860 });
+  }
 });
 
-test('shared-with-me and deep links', { skip }, async () => {
-  const friendPage = await browser.newPage();
-  await friendPage.goto(srv.url);
-  await friendPage.getByLabel('Email').fill('friend@example.com');
-  await friendPage.getByLabel('Password').fill('password123');
-  await friendPage.getByRole('button', { name: 'Sign in' }).click();
-  await friendPage.getByText('Shared with you').waitFor();
-  await friendPage.getByRole('link', { name: /guide.md/ }).click();
-  await friendPage.getByText('you are').waitFor();
-  assert.equal(await friendPage.getByRole('heading', { name: 'Sharing' }).count(), 0); // editors don't manage sharing
-  await friendPage.reload();
-  await friendPage.getByRole('heading', { name: 'History' }).waitFor();
-  if (shots) await friendPage.screenshot({ path: path.join(shots, 'home-dark.png') });
-  await friendPage.close();
+test('shared-with-me, editor view, dark mode', { skip }, async () => {
+  const p = await browser.newPage({ viewport: { width: 1280, height: 860 }, colorScheme: 'dark' });
+  await p.goto(srv.url);
+  await p.getByLabel('Email').fill('friend@example.com');
+  await p.getByLabel('Password').fill('password123');
+  await p.getByRole('button', { name: 'Sign in' }).click();
+  await p.getByRole('heading', { name: 'Shared with you' }).waitFor();
+  await shot(p, 'dashboard-dark');
+  await p.getByRole('link', { name: 'guide.md' }).click();
+  await p.getByText('you are editor').waitFor();
+  assert.equal(await p.getByRole('link', { name: 'Sharing' }).count(), 0); // editors don't manage sharing
+  await p.reload();
+  await p.getByRole('link', { name: /History/ }).click();
+  await p.getByRole('listitem', { name: /v3 Restored v1/ }).waitFor();
+  assert.equal(await p.getByRole('button', { name: 'Restore' }).count(), 0); // only the owner restores
+  await shot(p, 'history-dark');
+  await p.getByRole('button', { name: 'Account menu' }).click();
+  await p.getByRole('button', { name: 'Sign out' }).click();
+  await p.getByRole('heading', { name: 'Sign in to Tether' }).waitFor();
+  await p.close();
 });

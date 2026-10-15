@@ -82,6 +82,13 @@ export function createApp({ service, auth, consoleDir, maxFileSize }) {
     if (req.body.toVersion === undefined) throw badRequest('toVersion required');
     res.json(await service.rollback(req.uid, req.params.id, req.body.toVersion));
   });
+  api.get('/artifacts/:id/content', async (req, res) => {
+    const { name, bytes } = await service.content(req.uid, req.params.id, req.query.version);
+    res.set('content-type', 'application/octet-stream');
+    res.set('content-disposition', `attachment; filename="${encodeURIComponent(name)}"`);
+    res.set('cache-control', 'private, max-age=60');
+    res.send(bytes);
+  });
   api.get('/artifacts/:id/history', async (req, res) => res.json(await service.history(req.uid, req.params.id)));
   api.get('/artifacts/:id/sharing', async (req, res) => res.json(await service.sharing(req.uid, req.params.id)));
   api.post('/artifacts/:id/share', async (req, res) => res.json(await service.share(req.uid, req.params.id, req.body)));

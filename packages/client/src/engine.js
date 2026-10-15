@@ -5,7 +5,7 @@ import path from 'node:path';
 import { createTwoFilesPatch } from 'diff';
 import { canonicalize, sha256, resolveEol, newInstanceId, nameError, relPathError, caseCollisionError, isBinary } from '@tether/shared';
 import { ApiError, OfflineError } from './api.js';
-import { findRepo, gitBusy, installHooks, removeHooks, GIT_MODES } from './git.js';
+import { findRepo, gitBusy, removeHooks, GIT_MODES, gitBinary, head, changeFromGit, changesBetween, setKeep, isKept, restage, isAncestor, isTracked, fileBlob, blobAt, indexBlob } from './git.js';
 import {
   readLocal, writeLocal, styleOf, LockedError, keepBothName, moveFile, pruneEmptyDirs, walkFiles,
   samePath, isUnder, canonicalPath, statOrNull,
@@ -76,7 +76,13 @@ export class Engine {
   /** Writes content for an instance at `p`; records the result for the quick change check. */
   writeInstance(inst, p, sha, eolMode = inst.eolMode, exec = inst.exec) {
     const style = inst.eolStyle ? { eol: inst.eolStyle, bom: !!inst.hasBom } : null;
-    return writeLocal(p, this.blobFor(sha), eolMode, { exec, style });
+    const st = writeLocal(p, this.blobFor(sha), eolMode, { exec, style });
+    if (inst.gitMode === 'keep' && inst.gitRoot) {
+      restage(inst.gitRoot, p); // keep git's view clean (see setKeep)
+      const after = statOrNull(p);
+      if (after) Object.assign(st, { size: after.size, mtimeMs: after.mtimeMs });
+    }
+    return st;
   }
 
   // ---------- tick ----------
@@ -84,7 +90,7 @@ export class Engine {
   async tick({ remote = true } = {}) {
     this.busyCache = new Map();
     await this.locateAll();
-    if (remote) await this.gitTransitions();
+    await this.gitPass();
     if (remote) {
       await this.checkRemote();
       await this.syncRealtime();
@@ -102,16 +108,28 @@ export class Engine {
     return !!this.busyCache.get(inst.gitDir);
   }
 
+  gitInstances() {
+    return this.db.all().filter((i) => i.gitMode && i.gitRoot && i.mode !== 'orphaned');
+  }
+
   /** Sets the git mode on an instance (and a folder's files). Throws if follow is not allowed. */
   applyGitMode(root, mode) {
     if (!root) return;
     if (!GIT_MODES.includes(mode)) throw new UserError(`git mode must be one of ${GIT_MODES.join(', ')}`);
     if (mode === 'follow' && root.role === 'viewer') throw new UserError('git follow mode needs editor access');
+    if (mode === 'follow' && !gitBinary()) throw new UserError('git follow mode needs git to be installed');
     const repo = findRepo(root.path);
     if (!repo) throw new UserError(`${root.path} is not inside a git repository`);
-    const fields = { gitMode: mode, gitRoot: repo.root, gitDir: repo.gitDir, gitHooks: repo.hooksDir };
-    for (const i of [root, ...(root.kind === 'folder' ? this.db.childrenOf(root.instanceId) : [])]) this.db.update(i.instanceId, fields);
-    this.syncGitHooks();
+    const fields = { gitMode: mode, gitRoot: repo.root, gitDir: repo.gitDir, gitWaiting: false };
+    for (const i of [root, ...(root.kind === 'folder' ? this.db.childrenOf(root.instanceId) : [])]) {
+      this.db.update(i.instanceId, fields);
+      if (i.kind === 'file') setKeep(repo.root, i.path, mode === 'keep');
+    }
+  }
+
+  /** Lets git see the file normally again (after unmanage, orphaning, or leaving keep mode). */
+  releaseGit(inst) {
+    if (inst.gitMode === 'keep' && inst.kind === 'file' && inst.gitRoot) setKeep(inst.gitRoot, inst.path, false);
   }
 
   /** `tether git <path> [--mode]`: show or change the git mode of managed files. */
@@ -123,77 +141,143 @@ export class Engine {
     return this.targets(p).map((i) => ({ path: i.path, kind: i.kind, role: i.role, gitMode: this.db.get(i.instanceId)?.gitMode ?? null, gitRoot: this.db.get(i.instanceId)?.gitRoot ?? findRepo(i.path)?.root ?? null }));
   }
 
-  /** Installs hooks in repositories with follow-mode files and removes them where none remain. */
-  syncGitHooks() {
-    if (!this.home || !this.cliPath) return;
-    const want = new Set(this.db.all().filter((i) => i.gitMode === 'follow' && i.mode !== 'orphaned' && i.gitHooks).map((i) => i.gitHooks));
-    const had = new Set(this.db.getMeta('gitHooks') ?? []);
-    for (const dir of want) {
-      try {
-        installHooks(dir, { home: this.home, node: process.execPath, cli: this.cliPath });
-      } catch (e) {
-        this.log(`could not install git hooks in ${dir}: ${e.message}`);
-      }
-    }
-    for (const dir of had) if (!want.has(dir)) removeHooks(dir, this.home);
-    this.db.setMeta('gitHooks', [...want]);
+  /** Tether 0.2.0 used git hooks; they are no longer needed. */
+  cleanupLegacyHooks() {
+    const dirs = this.db.getMeta('gitHooks') ?? [];
+    for (const dir of dirs) if (this.home) removeHooks(dir, this.home);
+    if (dirs.length) this.db.setMeta('gitHooks', null);
   }
 
-  /** Repositories that just finished a git operation (merge resolved, rebase done) get reconciled. */
-  async gitTransitions() {
-    const dirs = new Map();
-    for (const i of this.db.all()) if (i.gitMode === 'follow' && i.gitDir && i.mode !== 'orphaned') dirs.set(i.gitDir, i.gitRoot);
-    for (const [gitDir, root] of dirs) {
-      const busy = gitBusy(gitDir);
-      const was = this.gitState.get(gitDir);
-      this.gitState.set(gitDir, busy);
-      if (was && !busy) await this.gitReconcile(root);
+  /** Managed files that ended up inside a git repository later (git init, moved into one) get keep mode. */
+  detectNewRepos() {
+    for (const i of this.db.all().filter((x) => !x.gitMode && !x.folderInstanceId && x.mode !== 'orphaned' && !x.detached)) {
+      const repo = findRepo(i.path);
+      if (!repo) continue;
+      this.applyGitMode(i, 'keep');
+      this.log(`${i.path}: now inside the git repository ${repo.root}; using keep mode`);
+      this.notify({ kind: 'git-new', level: 'info', short: path.basename(i.path), title: 'Managed file is now in a git repository', body: `${path.basename(i.path)} is inside ${repo.root}. Tether keeps it as the shared version and git ignores Tether's copy. Run "tether git ${path.basename(i.path)} --mode follow" to publish git's changes instead.` });
     }
   }
 
   /**
-   * After git changed files (hook, or the end of a merge/rebase): publish git's version of
-   * follow-mode files. If Tether also moved on, the file stays in editing mode for `tether done`.
+   * Runs after git may have changed files (watcher on the git directory, and every tick):
+   * follows renames git made, brings back files git restored, keeps keep-mode files hidden from
+   * git, and publishes follow-mode files whose content now matches git's committed or staged state.
    */
-  async gitReconcile(root) {
-    if (gitBusy(findRepo(root)?.gitDir)) return { busy: true };
-    const mine = () => this.db.all().filter((i) => i.gitMode === 'follow' && i.kind === 'file' && i.mode === 'normal' && i.gitRoot && samePath(i.gitRoot, root));
-    for (const i of mine().filter((x) => x.detached)) {
-      if (statOrNull(i.path)?.isFile()) {
-        this.db.update(i.instanceId, { ...this.identity(i.path), detached: false, missingSince: null, size: null, mtimeMs: null });
-        this.log(`${i.path}: back (restored by git)`);
+  async gitPass({ only } = {}) {
+    const repos = new Map();
+    for (const i of this.gitInstances()) if (!only || samePath(i.gitRoot, only)) repos.set(i.gitDir, i.gitRoot);
+    if (!repos.size) return;
+    const heads = this.db.getMeta('gitHeads') ?? {};
+    const publish = [];
+    for (const [gitDir, root] of repos) {
+      if (gitBusy(gitDir)) continue; // wait until git is done
+      const h = gitBinary() ? head(root) : null;
+      const prev = heads[gitDir];
+      const headMoved = !!h && h !== prev;
+      if (h && prev && h !== prev) await this.followGitHistory(root, prev, h);
+      if (h) heads[gitDir] = h;
+      for (const i of this.gitInstances().filter((x) => x.gitDir === gitDir)) {
+        if (i.kind !== 'file') continue;
+        if (i.detached) {
+          if (statOrNull(i.path)?.isFile()) {
+            this.db.update(i.instanceId, { ...this.identity(i.path), detached: false, missingSince: null, size: null, mtimeMs: null });
+            if (i.gitMode === 'keep') setKeep(root, i.path, true);
+            this.log(`${i.path}: back (restored by git)`);
+          }
+          continue;
+        }
+        if (i.mode !== 'normal') continue;
+        if (i.gitMode === 'keep') {
+          // Make sure the filter is in place (and git's cache current) whenever git moved.
+          if ((headMoved || !prev) && gitBinary() && !isKept(root, i.path)) setKeep(root, i.path, true);
+          continue;
+        }
+        if (!gitBinary()) continue;
+        let local;
+        try {
+          local = readLocal(i.path, i.eolMode);
+        } catch {
+          continue; // locked; next pass
+        }
+        if (i.gitOverlay) {
+          // The overlay ends when the file matches git again: git changed it (git's version wins and
+          // is published below) or git now has the same content (someone committed it).
+          if (fileBlob(root, i.path) !== blobAt(root, 'HEAD', i.path)) continue;
+          setKeep(root, i.path, false);
+          this.db.update(i.instanceId, { gitOverlay: false });
+          i.gitOverlay = false;
+        }
+        const folder = i.folderInstanceId ? this.folderOf(i) : null;
+        const rel = folder ? this.localRel(i, folder) : null;
+        const moved = folder && rel && rel !== i.relPath;
+        const changed = local && local.hash !== i.baseHash;
+        if (!changed && !moved) continue;
+        const { fromGit, commit } = changed ? changeFromGit(root, i.path) : { fromGit: true, commit: null };
+        if (fromGit) publish.push({ inst: i, local: changed ? local : null, commit, relPath: moved ? rel : undefined });
       }
     }
-    await this.locateAll();
-    const changed = [];
-    for (const i of mine().filter((x) => !x.detached)) {
-      try {
-        const local = readLocal(i.path, i.eolMode);
-        if (local && local.hash !== i.baseHash) changed.push({ inst: i, local });
-      } catch {
-        // locked: the next pass will retry
+    this.db.setMeta('gitHeads', heads);
+    if (publish.length) await this.publishGitChanges(publish);
+  }
+
+  /** Renames and new files git brought in between two commits. */
+  async followGitHistory(root, from, to) {
+    for (const c of changesBetween(root, from, to)) {
+      if (c.status === 'R') {
+        const inst = this.gitInstances().find((i) => i.kind === 'file' && samePath(i.path, c.from));
+        if (inst && !statOrNull(c.from) && statOrNull(c.to)?.isFile()) {
+          this.db.update(inst.instanceId, { path: canonicalPath(c.to), ...this.identity(c.to), detached: false, missingSince: null, size: null, mtimeMs: null });
+          if (inst.gitMode === 'keep') {
+            setKeep(root, c.from, false);
+            setKeep(root, c.to, true);
+          }
+          this.log(`${c.from} -> ${c.to}: followed a rename made in git`);
+        }
+      } else if (c.status === 'A' && !this.instanceAt(c.to) && statOrNull(c.to)?.isFile()) {
+        const folder = this.gitInstances().find((i) => i.kind === 'folder' && i.gitMode === 'follow' && isUnder(c.to, i.path) && !samePath(c.to, i.path));
+        if (!folder) continue;
+        const name = path.basename(c.to);
+        if (folder.role === 'owner') {
+          try {
+            const r = await this.add({ path: c.to, gitCommit: to });
+            this.log(`${c.to}: added to ${folder.path} (new in git)`);
+            this.notify({ kind: 'git-published', level: 'info', short: name, title: "Published git's changes", body: `${r.relPath} is new in git and was added to ${path.basename(folder.path)} for everyone.` });
+          } catch (e) {
+            this.log(`${c.to}: could not add (${e.message})`);
+          }
+        } else {
+          this.notify({ kind: 'git-new-file', level: 'info', short: name, title: 'New file in a managed folder', body: `git added ${name} inside ${path.basename(folder.path)}. Only the owner can add files to it, so it is not shared through Tether.` });
+        }
       }
     }
-    if (!changed.length) return { published: 0 };
+  }
+
+  /**
+   * Publishes git's version of follow-mode files. If Tether already has exactly that content it is
+   * adopted; if Tether moved on to something else, the file stays in editing mode for `tether done`.
+   */
+  async publishGitChanges(list) {
     let results;
     try {
-      ({ results } = await this.api.call('POST', '/sync/check', { items: changed.map(({ inst }) => ({ artifactId: inst.artifactId, version: inst.baseVersion })) }));
+      ({ results } = await this.api.call('POST', '/sync/check', { items: list.map(({ inst }) => ({ artifactId: inst.artifactId, version: inst.baseVersion })) }));
     } catch (e) {
       if (!(e instanceof OfflineError)) throw e;
       // Offline: hold git's version (editing) instead of reverting it; `tether done` pushes later.
-      for (const { inst } of changed) this.db.update(inst.instanceId, { mode: 'editing', lastError: 'git changed this file while offline; run `tether done` to publish it' });
-      return { published: 0, offline: true };
+      for (const { inst } of list) this.db.update(inst.instanceId, { mode: 'editing', lastError: 'git changed this file while offline; run `tether done` to publish it' });
+      return;
     }
-    let published = 0;
-    for (const [k, { inst, local }] of changed.entries()) {
+    for (const [k, { inst, local, commit, relPath }] of list.entries()) {
       const r = results[k];
       const name = path.basename(inst.path);
+      const hash = local?.hash ?? inst.baseHash;
       if (r.status === 'gone' || r.state?.deleted || r.folderDeleted) {
         this.orphan(inst, r.reason ?? 'deleted');
         continue;
       }
       if (r.role === 'viewer') {
         this.db.update(inst.instanceId, { gitMode: 'keep', role: 'viewer' });
+        setKeep(inst.gitRoot, inst.path, true);
         continue; // reverted by the normal pass
       }
       const conflict = () => {
@@ -201,18 +285,30 @@ export class Engine {
         this.log(`${inst.path}: git changed it but Tether also has a newer version; left in editing mode`);
         this.notify({ kind: 'conflict', level: 'warn', title: 'Merge conflict (git and Tether)', body: `${name}: git changed it, but someone also pushed a newer version to Tether. Git's version is kept and the file is in editing mode; run "tether done" to choose.`, short: name, artifactId: inst.artifactId });
       };
+      const adopt = (state) => {
+        this.db.update(inst.instanceId, { baseVersion: state.version, remoteVersion: state.version, baseHash: state.blob, relPath: state.relPath ?? inst.relPath, gitWaiting: false, lastError: null, ...(local ? { size: local.size, mtimeMs: local.mtimeMs, ...styleOf(local) } : {}) });
+        this.log(`${inst.path}: git's version is already on Tether (v${state.version})`);
+      };
       if (r.status === 'changed') {
-        conflict();
+        if (r.state.blob === hash && (relPath === undefined || r.state.relPath === relPath)) adopt(r.state); // e.g. a teammate published the same commit
+        else conflict();
         continue;
       }
       try {
-        await this.api.uploadBlobs([{ sha256: local.hash, bytes: local.canonical }]);
-        this.cache.put(local.hash, local.canonical);
-        const c = await this.api.call('POST', `/artifacts/${inst.artifactId}/commit`, { baseVersion: inst.baseVersion, change: { blob: local.hash, size: local.canonical.length } });
-        this.db.update(inst.instanceId, { baseVersion: c.version, remoteVersion: c.version, baseHash: local.hash, size: local.size, mtimeMs: local.mtimeMs, ...styleOf(local), lastError: null });
+        const change = { gitCommit: commit ?? null };
+        if (local) {
+          await this.api.uploadBlobs([{ sha256: local.hash, bytes: local.canonical }]);
+          this.cache.put(local.hash, local.canonical);
+          Object.assign(change, { blob: local.hash, size: local.canonical.length });
+        }
+        if (relPath !== undefined) change.relPath = relPath;
+        const c = await this.api.call('POST', `/artifacts/${inst.artifactId}/commit`, { baseVersion: inst.baseVersion, change });
+        this.db.update(inst.instanceId, {
+          baseVersion: c.version, remoteVersion: c.version, baseHash: hash, relPath: relPath ?? inst.relPath, gitWaiting: false, lastError: null,
+          ...(local ? { size: local.size, mtimeMs: local.mtimeMs, ...styleOf(local) } : {}),
+        });
         this.log(`${inst.path}: published git's version as v${c.version}`);
         this.notify({ kind: 'git-published', level: 'info', title: "Published git's changes", body: `${name} is now v${c.version} for everyone who has it.`, short: name, artifactId: inst.artifactId });
-        published++;
       } catch (e) {
         if (e instanceof ApiError && e.status === 409) conflict();
         else if (e instanceof ApiError) {
@@ -221,7 +317,12 @@ export class Engine {
         } else throw e;
       }
     }
-    return { published };
+  }
+
+  /** Hook calls from Tether 0.2.0 installs, and explicit syncs. */
+  async gitReconcile(root) {
+    await this.locateAll();
+    await this.gitPass({ only: root });
   }
 
   // ---------- realtime editing ----------
@@ -370,8 +471,9 @@ export class Engine {
       this.log(`${inst.path}: folder deleted locally; no longer managed here`);
       return;
     }
-    if (inst.gitMode === 'follow' && inst.mode === 'normal' && !inst.folderInstanceId) {
-      // Usually a branch switch: keep tracking and pick the file up again when git restores it.
+    if (inst.gitMode && inst.mode === 'normal') {
+      // Inside a git repository a vanished file is usually a branch switch, a rename or git clean:
+      // keep tracking it and pick it up again when git brings it back (or follow the rename).
       this.db.update(inst.instanceId, { detached: true, missingSince: null });
       this.log(`${inst.path}: removed (by git?); waiting for git to bring it back`);
     } else if (inst.mode === 'editing') {
@@ -388,7 +490,10 @@ export class Engine {
 
   orphan(inst, reason) {
     const targets = inst.kind === 'folder' ? [inst, ...this.db.childrenOf(inst.instanceId)] : [inst];
-    for (const t of targets) this.db.update(t.instanceId, { mode: 'orphaned', orphanReason: reason });
+    for (const t of targets) {
+      this.releaseGit(t);
+      this.db.update(t.instanceId, { mode: 'orphaned', orphanReason: reason });
+    }
     const what = reason === 'revoked' ? 'access revoked' : reason === 'deleted' ? 'deleted on the server' : 'removed from the server';
     this.log(`${inst.path}: ${what}; file kept, no longer tracked`);
     this.notify({ kind: 'orphaned', level: 'warn', title: 'No longer synced', body: `${path.basename(inst.path)}: ${what}. Your copy stays on disk but Tether no longer keeps it up to date.`, short: path.basename(inst.path) });
@@ -443,9 +548,17 @@ export class Engine {
     });
 
     const newChildren = [];
+    const waiting = new Set(); // folders with new files that should arrive through git first
     for (const f of folders) {
       const have = new Set(this.db.childrenOf(f.inst.instanceId).map((c) => c.artifactId));
-      for (const c of f.children) if (!c.deleted && !have.has(c.artifactId)) newChildren.push({ folder: f.inst, child: c });
+      for (const c of f.children) {
+        if (c.deleted || have.has(c.artifactId)) continue;
+        if (f.inst.gitMode === 'follow' && c.gitCommit && !isAncestor(f.inst.gitRoot, c.gitCommit)) {
+          waiting.add(f.inst.instanceId); // creating it now would block the git pull that brings it
+          continue;
+        }
+        newChildren.push({ folder: f.inst, child: c });
+      }
     }
     try {
       await this.ensureBlobs([
@@ -456,7 +569,16 @@ export class Engine {
       if (e instanceof OfflineError) return (this.offline = e.message);
       throw e;
     }
-    for (const { inst, state } of incoming) if (!this.isGitBusy(inst)) this.applyIncoming(inst, state);
+    for (const { inst, state } of incoming) {
+      if (this.isGitBusy(inst)) continue;
+      if (inst.gitMode === 'follow' && state.gitCommit && !isAncestor(inst.gitRoot, state.gitCommit)) {
+        // Writing it now would make git see a local change and refuse the pull that brings it.
+        if (!inst.gitWaiting) this.log(`${inst.path}: v${state.version} came from git commit ${state.gitCommit.slice(0, 8)}; it will arrive with your next git pull`);
+        this.db.update(inst.instanceId, { gitWaiting: true });
+        continue;
+      }
+      this.applyIncoming(inst, state);
+    }
     for (const { folder, child } of newChildren) {
       this.db.insert({
         instanceId: newInstanceId(), artifactId: child.artifactId, kind: 'file', folderInstanceId: folder.instanceId,
@@ -466,11 +588,15 @@ export class Engine {
       });
       this.log(`${folder.path}: new file ${child.relPath}`);
     }
-    for (const f of folders) this.db.update(f.inst.instanceId, { baseVersion: f.state.version });
+    // A folder with files still waiting for git stays behind, so they are offered again next pass.
+    for (const f of folders) if (!waiting.has(f.inst.instanceId)) this.db.update(f.inst.instanceId, { baseVersion: f.state.version });
   }
 
   /** Normal mode: write an incoming version (content and/or layout). */
   applyIncoming(inst, state) {
+    // Never recreate a file that is missing right now (deleted, or mid-rename by git): the
+    // delete/rename handling decides what happens to it.
+    if (!statOrNull(inst.path)) return;
     try {
       let p = inst.path;
       if (inst.folderInstanceId && state.relPath !== inst.relPath) {
@@ -482,11 +608,18 @@ export class Engine {
         p = to;
         this.log(`${inst.path} -> ${to}: moved by the server`);
       }
-      const patch = { path: p, relPath: state.relPath, baseVersion: state.version, baseHash: state.blob, eolMode: state.eol, exec: state.exec, lastError: null };
+      const patch = { path: p, relPath: state.relPath, baseVersion: state.version, baseHash: state.blob, eolMode: state.eol, exec: state.exec, lastError: null, gitWaiting: false };
       const localEdit = !this.matchesBase(inst, p) && readLocal(p, inst.eolMode)?.hash !== state.blob;
       if (state.blob !== inst.baseHash || localEdit) {
         Object.assign(patch, this.writeInstance(inst, p, state.blob, state.eol, state.exec));
         this.log(`${p}: updated to version ${state.version}${localEdit ? ' (local change replaced)' : ''}`);
+        if (inst.gitMode === 'follow' && inst.gitRoot && !state.gitCommit && blobAt(inst.gitRoot, 'HEAD', p) !== fileBlob(inst.gitRoot, p)) {
+          // A version that exists only in Tether: hide it from git (like keep mode) so it never
+          // blocks a pull. When git next changes the file, git's version wins (follow).
+          setKeep(inst.gitRoot, p, true);
+          patch.gitOverlay = true;
+          this.notify({ kind: 'git-overlay', level: 'info', short: path.basename(p), artifactId: inst.artifactId, title: 'Changed through Tether', body: `${path.basename(p)} now has Tether's v${state.version}, which is not in git. Git does not see this change; the next change to the file in git replaces it.` });
+        }
         if (localEdit) {
           const name = path.basename(p);
           this.notify({
@@ -698,7 +831,7 @@ export class Engine {
   }
 
   /** `tether add <path>`: owner adds a new file inside a managed folder. */
-  async add({ path: target }) {
+  async add({ path: target, gitCommit }) {
     const abs = canonicalPath(path.resolve(target));
     if (!statOrNull(abs)?.isFile()) throw new UserError(`${abs} is not a file`);
     if (this.instanceAt(abs)) throw new UserError(`${abs} is already managed`);
@@ -711,7 +844,7 @@ export class Engine {
     const repo = (await this.api.call('GET', '/repos')).find((r) => r.repoId === folder.repoId);
     const f = this.prepareFile(abs, rel, repo?.eolDefaults ?? {});
     await this.api.uploadBlobs([f]);
-    const child = await this.api.call('POST', `/artifacts/${folder.artifactId}/children`, { relPath: rel, blob: f.sha256, size: f.size, eol: f.eol, exec: f.exec });
+    const child = await this.api.call('POST', `/artifacts/${folder.artifactId}/children`, { relPath: rel, blob: f.sha256, size: f.size, eol: f.eol, exec: f.exec, gitCommit });
     this.cache.put(f.sha256, f.bytes);
     const local = readLocal(abs, f.eol);
     this.db.insert({
@@ -749,26 +882,38 @@ export class Engine {
 
     if (a.kind === 'file') {
       await this.ensureBlobs([{ artifactId: a.artifactId, version: a.version, sha: a.blob }]);
-      const existing = readLocal(target, a.eol);
-      if (existing && existing.hash !== a.blob) throw new UserError(`${target} already exists with different content; choose another destination`);
+      let existing = readLocal(target, a.eol);
+      let mode = 'normal';
+      let lastError = null;
+      let note;
+      if (existing && existing.hash !== a.blob) {
+        const clash = this.gitClash(target, gitMode, a.relPath ?? a.name);
+        if (clash === 'replace') {
+          existing = null; // Tether's version wins; git still has its own
+          note = "replaced git's version with Tether's (git still has it)";
+        } else {
+          mode = 'editing';
+          lastError = "git's version differs from Tether's; run `tether done` to publish it or accept Tether's";
+          note = "kept git's version; run `tether done` to publish it or accept Tether's";
+        }
+      }
       const st = existing ? { size: existing.size, mtimeMs: existing.mtimeMs, ...styleOf(existing) } : writeLocal(target, this.blobFor(a.blob), a.eol, { exec: a.exec });
       this.db.insert({
         ...base, instanceId: newInstanceId(), artifactId: a.artifactId, kind: 'file', name: a.name, path: canonicalPath(target),
-        ...this.identity(target), mode: 'normal', baseVersion: a.version, baseHash: a.blob, ...st, eolMode: a.eol, exec: a.exec, remoteVersion: a.version,
+        ...this.identity(target), mode, lastError, baseVersion: a.version, baseHash: a.blob, ...st, eolMode: a.eol, exec: a.exec, remoteVersion: a.version,
       });
-      return { kind: 'file', path: canonicalPath(target), role: r.role, version: a.version };
+      return { kind: 'file', path: canonicalPath(target), role: r.role, version: a.version, note };
     }
 
     const st = statOrNull(target);
     if (st && !st.isDirectory()) throw new UserError(`${target} exists and is not a folder`);
     await this.ensureBlobs(r.children.map((c) => ({ artifactId: c.artifactId, version: c.version, sha: c.blob })));
-    const clashes = [];
+    const clashes = new Map(); // relPath -> 'replace' | 'keep-git'
     for (const c of r.children) {
       const p = path.join(target, ...c.relPath.split('/'));
       const ex = readLocal(p, c.eol);
-      if (ex && ex.hash !== c.blob) clashes.push(c.relPath);
+      if (ex && ex.hash !== c.blob) clashes.set(c.relPath, this.gitClash(p, gitMode, c.relPath));
     }
-    if (clashes.length) throw new UserError(`${target} already has different files: ${clashes.join(', ')}; choose another destination`);
     fs.mkdirSync(target, { recursive: true });
     const folderInst = this.db.insert({
       ...base, instanceId: newInstanceId(), artifactId: a.artifactId, kind: 'folder', name: a.name, path: canonicalPath(target),
@@ -776,15 +921,33 @@ export class Engine {
     });
     for (const c of r.children) {
       const p = path.join(folderInst.path, ...c.relPath.split('/'));
-      const ex = readLocal(p, c.eol);
+      const clash = clashes.get(c.relPath);
+      const ex = clash === 'replace' ? null : readLocal(p, c.eol);
       const cst = ex ? { size: ex.size, mtimeMs: ex.mtimeMs, ...styleOf(ex) } : writeLocal(p, this.blobFor(c.blob), c.eol, { exec: c.exec });
       this.db.insert({
         ...base, instanceId: newInstanceId(), artifactId: c.artifactId, kind: 'file', folderInstanceId: folderInst.instanceId, name: c.name,
-        relPath: c.relPath, path: canonicalPath(p), ...this.identity(p), mode: 'normal', baseVersion: c.version, baseHash: c.blob, ...cst,
+        relPath: c.relPath, path: canonicalPath(p), ...this.identity(p), baseVersion: c.version, baseHash: c.blob, ...cst,
+        mode: clash === 'keep-git' ? 'editing' : 'normal', lastError: clash === 'keep-git' ? "git's version differs from Tether's; run `tether done`" : null,
         eolMode: c.eol, exec: c.exec, remoteVersion: c.version,
       });
     }
     return { kind: 'folder', path: folderInst.path, role: r.role, files: r.children.length, version: a.version };
+  }
+
+  /**
+   * A pulled file already exists with different content. Only allowed when git holds that
+   * content safely (tracked, no uncommitted changes): keep mode replaces it with Tether's version,
+   * follow mode keeps git's version in editing mode. Otherwise the pull is refused.
+   */
+  gitClash(p, gitMode, label) {
+    const repo = gitMode && findRepo(p);
+    if (repo && gitBinary() && isTracked(repo.root, p)) {
+      const blob = fileBlob(repo.root, p);
+      const clean = blob && (blob === blobAt(repo.root, 'HEAD', p) || blob === indexBlob(repo.root, p));
+      if (clean) return gitMode === 'keep' ? 'replace' : 'keep-git';
+      throw new UserError(`${label} differs from Tether's version and has uncommitted git changes; commit or stash them first`);
+    }
+    throw new UserError(`${p} already exists with different content; choose another destination`);
   }
 
   /** Instances addressed by a path: a file, a managed folder (with its files), or any directory. */
@@ -857,6 +1020,7 @@ export class Engine {
 
   async unmanage({ path: p }) {
     for (const i of this.targets(p).filter((x) => x.realtime)) await this.releaseRealtime(i);
+    for (const i of this.targets(p)) this.releaseGit(i);
     return { changed: this.setMode(p, 'unmanaged', ['normal', 'editing']) };
   }
 
@@ -1000,6 +1164,10 @@ export class Engine {
           if (rel && rel !== inst.relPath) change.relPath = rel;
         }
         const baseVersion = item.incoming ? item.serverVersion : inst.baseVersion;
+        if (inst.gitMode === 'follow' && inst.gitRoot && change.blob) {
+          const g = changeFromGit(inst.gitRoot, inst.path);
+          if (g.fromGit && g.commit) change.gitCommit = g.commit; // teammates get it through git
+        }
         const r = await this.api.call('POST', `/artifacts/${inst.artifactId}/commit`, { baseVersion, change });
         const state = r.state;
         this.db.update(inst.instanceId, {
@@ -1067,6 +1235,8 @@ export class Engine {
       if (i.orphanReason) flags.push(i.orphanReason);
       if (i.realtime && i.mode === 'editing') flags.push('realtime: your saves are pushed live');
       if (i.gitMode) flags.push(`git: ${i.gitMode}`);
+      if (i.gitWaiting) flags.push('newer version arrives with your next git pull');
+      if (i.gitOverlay) flags.push('Tether-only version (hidden from git)');
       if (i.remoteRealtime && i.mode !== 'orphaned') flags.push(`realtime edits by ${JSON.parse(i.remoteRealtime).email}`);
       return {
         instanceId: i.instanceId, artifactId: i.artifactId, kind: i.kind, path: i.path, relPath: i.relPath, mode: i.mode, role: i.role,

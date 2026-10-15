@@ -20,7 +20,7 @@ try {
   await page.getByLabel('Email').fill(email);
   await page.getByLabel('Password').fill(password);
   await page.getByRole('button', { name: 'Create account' }).click();
-  await page.getByText('Your repositories').waitFor({ timeout: 20000 });
+  await page.getByRole('heading', { name: 'Your repositories' }).waitFor({ timeout: 20000 });
   console.log('- signed up in the console (Firebase Auth)');
 
   const { url, state } = await cli.ipc('login.start');
@@ -36,19 +36,14 @@ try {
   cli.write('readme.md', '# hi\n');
   await cli.run(['manage', 'readme.md', '--repo', 'web']);
   await page.goto(SERVER);
-  await page.getByRole('link', { name: /^web r_/ }).click();
-  try {
-    await page.getByRole('link', { name: 'readme.md' }).click({ timeout: 15000 });
-  } catch (e) {
-    if (shots) await page.screenshot({ path: `${shots}/prod-fail.png`, fullPage: true });
-    console.log('page text:', (await page.locator('main').innerText()).slice(0, 500));
-    throw e;
-  }
-  await page.getByRole('heading', { name: 'Sharing' }).waitFor();
+  await page.getByRole('link', { name: /\/web$/ }).click();
+  await page.getByRole('link', { name: 'readme.md' }).click();
+  await page.getByRole('table', { name: 'File content' }).getByText('# hi').waitFor();
   if (shots) await page.screenshot({ path: `${shots}/prod-artifact.png`, fullPage: true });
-  console.log('- console shows the artifact uploaded by the CLI');
+  console.log('- console shows the artifact uploaded by the CLI, with a content preview');
 
   await page.goto(SERVER);
+  await page.getByRole('button', { name: 'Account menu' }).click();
   await page.getByRole('button', { name: 'Sign out' }).click();
   await page.getByRole('button', { name: 'Forgot password?' }).waitFor();
   console.log('- sign out; password reset is offered');

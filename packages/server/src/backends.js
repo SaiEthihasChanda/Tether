@@ -44,7 +44,11 @@ export async function createFirebaseBackend({ firebase, maxFileSize }) {
   if (!blobs) {
     const { getStorage } = await import('firebase-admin/storage');
     const { GcsBlobStore } = await import('./blobs/gcs.js');
-    blobs = new GcsBlobStore(getStorage(app).bucket(), { maxFileSize });
+    const storage = getStorage(app);
+    // New content goes to the data bucket next to the API; the default bucket stays readable.
+    blobs = firebase.dataBucket
+      ? new GcsBlobStore(storage.bucket(firebase.dataBucket), { maxFileSize, legacy: storage.bucket() })
+      : new GcsBlobStore(storage.bucket(), { maxFileSize });
   }
   const auth = new FirebaseAuth(store, getAuth(app), { ...firebase, emulatorHost: process.env.FIREBASE_AUTH_EMULATOR_HOST });
   return { store, blobs, auth, close: () => deleteApp(app) };

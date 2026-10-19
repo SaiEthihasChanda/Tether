@@ -68,7 +68,7 @@ try {
   const refused = await owner.run(['edit', 'cfg.txt', '--realtime'], { allowFail: true });
   assert.match(refused.stderr, /already being edited in realtime/);
   bob.write('cfg.txt', 'live from bob\n');
-  await eventually(async () => /pushed v\d+ \(realtime\)/.test(await bob.log()), { timeout: 15000, message: 'live push' });
+  await eventually(async () => /pushed v\d+ \(realtime/.test(await bob.log()), { timeout: 15000, message: 'live push' });
   await owner.sync();
   assert.equal(lf(owner.read('cfg.txt')), 'live from bob\n');
   await bob.run(['done', 'cfg.txt']);

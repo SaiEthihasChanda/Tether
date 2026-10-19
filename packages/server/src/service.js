@@ -1,7 +1,23 @@
 // All server-side rules live here: roles, version compare-and-set, validation, purges.
 // The HTTP layer only parses requests and calls these methods (DESIGN §3, §6.3, §7, §8.2, §10).
 import path from 'node:path';
-import { newArtifactId, newRepoId, newShareId, nameError, relPathError, caseCollisionError, EOL_MODES, sha256 } from '@tether/shared';
+import { newArtifactId, newRepoId, newShareId, nameError, relPathError, caseCollisionError, EOL_MODES, sha256, CHUNK_MAX } from '@tether/shared';
+
+const HASH = /^[0-9a-f]{64}$/;
+const FETCH_LIMIT = 8 * 1024 * 1024; // bytes per chunk fetch response
+
+/** Runs fn over items with limited concurrency. */
+async function mapLimit(items, limit, fn) {
+  const out = new Array(items.length);
+  let next = 0;
+  await Promise.all(Array.from({ length: Math.min(limit, items.length) }, async () => {
+    while (next < items.length) {
+      const i = next++;
+      out[i] = await fn(items[i], i);
+    }
+  }));
+  return out;
+}
 import { badRequest, forbidden, notFound, conflict, tooLarge } from './errors.js';
 import { publicUser } from './auth/local.js';
 
@@ -126,6 +142,55 @@ export class TetherService {
     return actual;
   }
 
+  /**
+   * Validates a file's content reference: a chunk list (delta sync) or, from older clients,
+   * a whole uploaded blob. Returns { size, chunks } to store. `known` chunks (from the current
+   * version) are already stored and are not checked again.
+   */
+  async checkContent(sha, size, chunks, known = []) {
+    if (!chunks) return { size: await this.checkBlob(sha, size), chunks: null };
+    if (!HASH.test(String(sha))) throw badRequest('invalid content hash');
+    if (!Array.isArray(chunks)) throw badRequest('invalid chunk list');
+    if (size > this.maxFileSize) throw tooLarge(`file is larger than the ${this.maxFileSize} byte limit`);
+    let total = 0;
+    const list = chunks.map((c) => {
+      if (!HASH.test(String(c?.h)) || !Number.isInteger(c.s) || c.s < 0 || c.s > CHUNK_MAX) throw badRequest('invalid chunk');
+      total += c.s;
+      return { h: c.h, s: c.s };
+    });
+    if (total !== size) throw badRequest('chunk sizes do not add up to the file size');
+    const have = new Set(known.map((c) => c.h));
+    const missing = await this.missingChunks([...new Set(list.map((c) => c.h))].filter((h) => !have.has(h)));
+    if (missing.length) throw badRequest(`${missing.length} chunk(s) have not been uploaded`);
+    return { size, chunks: list };
+  }
+
+  async missingChunks(hashes) {
+    const present = await mapLimit(hashes, 64, (h) => (this.blobs.hasHere ? this.blobs.hasHere(h) : this.blobs.has(h)));
+    return hashes.filter((_, i) => !present[i]);
+  }
+
+  /** The chunk list of a stored version; content from older clients is one whole-file chunk. */
+  manifestOf(state) {
+    if (state.chunks) return state.chunks;
+    return state.blob ? [{ h: state.blob, s: state.size ?? 0 }] : [];
+  }
+
+  async versionState(a, version) {
+    if (version === undefined || version === null || Number(version) === a.currentVersion) return { version: a.currentVersion, blob: a.blob, size: a.size, chunks: a.chunks };
+    const v = await this.store.version(a._id, Number(version));
+    if (!v) throw notFound(`version ${version} not found`);
+    return { version: v.version, blob: v.blob, size: v.size, chunks: v.chunks };
+  }
+
+  /** Whole content of a stored version (reassembled from its chunks). */
+  async assemble(state) {
+    const parts = await mapLimit(this.manifestOf(state), 64, (c) => this.blobs.read(c.h));
+    const bytes = Buffer.concat(parts);
+    if (state.blob && sha256(bytes) !== state.blob) throw new Error('stored content does not match its hash');
+    return bytes;
+  }
+
   checkEol(eol) {
     if (eol && !EOL_MODES.includes(eol)) throw badRequest(`eol must be one of ${EOL_MODES.join(', ')}`);
     return eol || 'auto';
@@ -240,7 +305,7 @@ export class TetherService {
   // ---- artifacts ----
 
   /** `tether manage`: upload a file or folder; the caller becomes the owner. */
-  async manage(uid, { repoId, kind, name, blob, size, eol, exec, files }) {
+  async manage(uid, { repoId, kind, name, blob, size, eol, exec, files, chunks }) {
     await this.requireRepoOwner(uid, repoId);
     const e = nameError(String(name || ''));
     if (e) throw badRequest(e);
@@ -262,7 +327,7 @@ export class TetherService {
     };
     const children = [];
     if (kind === 'file') {
-      Object.assign(root, { blob, size: await this.checkBlob(blob, size), eol: this.checkEol(eol), exec: !!exec });
+      Object.assign(root, { blob, ...(await this.checkContent(blob, size, chunks)), eol: this.checkEol(eol), exec: !!exec });
     } else if (kind === 'folder') {
       if (!Array.isArray(files)) throw badRequest('files required for a folder');
       this.checkLayout(files.map((f) => f.relPath));
@@ -277,7 +342,7 @@ export class TetherService {
           currentVersion: 1,
           deleted: false,
           blob: f.blob,
-          size: await this.checkBlob(f.blob, f.size),
+          ...(await this.checkContent(f.blob, f.size, f.chunks)),
           eol: this.checkEol(f.eol),
           exec: !!f.exec,
         });
@@ -291,11 +356,11 @@ export class TetherService {
   }
 
   snapshot(a) {
-    return { blob: a.blob ?? null, size: a.size ?? 0, relPath: a.relPath ?? null, deleted: !!a.deleted, gitCommit: a.gitCommit ?? null };
+    return { blob: a.blob ?? null, size: a.size ?? 0, chunks: a.chunks ?? null, relPath: a.relPath ?? null, deleted: !!a.deleted, gitCommit: a.gitCommit ?? null };
   }
 
   /** `tether add`: owner adds a new file to a folder artifact. */
-  async addChild(uid, folderId, { relPath, blob, size, eol, exec, gitCommit }) {
+  async addChild(uid, folderId, { relPath, blob, size, eol, exec, gitCommit, chunks }) {
     if (gitCommit != null && !/^[0-9a-f]{40,64}$/.test(String(gitCommit))) throw badRequest('invalid git commit');
     const { artifact: folder } = await this.requireOwner(uid, folderId);
     if (folder.kind !== 'folder') throw badRequest('not a folder artifact');
@@ -314,7 +379,7 @@ export class TetherService {
       currentVersion: 1,
       deleted: false,
       blob,
-      size: await this.checkBlob(blob, size),
+      ...(await this.checkContent(blob, size, chunks)),
       eol: this.checkEol(eol),
       exec: !!exec,
       gitCommit: gitCommit ?? null,
@@ -421,7 +486,7 @@ export class TetherService {
     if (change.blob !== undefined && change.blob !== a.blob) {
       if (a.kind !== 'file') throw badRequest('folders have no content');
       set.blob = change.blob;
-      set.size = await this.checkBlob(change.blob, change.size);
+      Object.assign(set, await this.checkContent(change.blob, change.size, change.chunks, a.chunks ?? []));
       types.push('content');
     }
     if (change.relPath !== undefined && change.relPath !== a.relPath) {
@@ -456,7 +521,7 @@ export class TetherService {
     if (a.kind !== 'file') throw badRequest('roll back individual files inside a folder');
     const v = await this.store.version(a._id, Number(toVersion));
     if (!v) throw notFound(`version ${toVersion} not found`);
-    const set = { blob: v.blob, size: v.size, deleted: !!v.deleted, gitCommit: null, updatedAt: new Date() };
+    const set = { blob: v.blob, size: v.size, chunks: v.chunks ?? null, deleted: !!v.deleted, gitCommit: null, updatedAt: new Date() };
     if (a.parentFolderId) {
       set.relPath = v.relPath;
       set.name = path.posix.basename(v.relPath);
@@ -497,7 +562,7 @@ export class TetherService {
     await this.access(uid, artifactId);
     const versions = await this.store.versionsOf(artifactId);
     const users = new Map((await this.store.usersByIds([...new Set(versions.map((v) => v.authorUid))])).map((u) => [u._id, u]));
-    return versions.map(({ _id, artifactId: _, ...v }) => ({ ...v, author: users.get(v.authorUid)?.email ?? '(deleted user)' }));
+    return versions.map(({ _id, artifactId: _, chunks: __, ...v }) => ({ ...v, author: users.get(v.authorUid)?.email ?? '(deleted user)' }));
   }
 
   // ---- sharing ----
@@ -588,28 +653,78 @@ export class TetherService {
   async content(uid, artifactId, version) {
     const { artifact: a } = await this.access(uid, artifactId);
     if (a.kind !== 'file') throw badRequest('folders have no content');
-    let sha = a.blob;
-    if (version !== undefined && Number(version) !== a.currentVersion) {
-      const v = await this.store.version(a._id, Number(version));
-      if (!v) throw notFound(`version ${version} not found`);
-      sha = v.blob;
+    const state = await this.versionState(a, version);
+    if (!state.blob) throw notFound('this version has no content');
+    return { name: a.name, bytes: state.chunks ? await this.assemble(state) : await this.blobs.read(state.blob) };
+  }
+
+  // ---- chunks (delta sync) ----
+
+  /** Which chunks still need uploading. With artifactId, chunks of its current version are known to exist. */
+  async chunksMissing(uid, hashes, artifactId) {
+    if (!Array.isArray(hashes) || hashes.length > 20000 || !hashes.every((h) => HASH.test(String(h)))) throw badRequest('invalid chunk hashes');
+    let known = new Set();
+    if (artifactId) {
+      const { artifact: a } = await this.access(uid, artifactId);
+      known = new Set(this.manifestOf(a).map((c) => c.h));
     }
-    if (!sha) throw notFound('this version has no content');
-    return { name: a.name, bytes: await this.blobs.read(sha) };
+    return this.missingChunks([...new Set(hashes)].filter((h) => !known.has(h)));
+  }
+
+  /** Stores uploaded chunks: entries [{h, s}] describe consecutive slices of body. */
+  async putChunks(entries, body) {
+    if (!Array.isArray(entries) || !entries.length || entries.length > 1000) throw badRequest('invalid chunk list');
+    let offset = 0;
+    const parts = entries.map(({ h, s }) => {
+      if (!HASH.test(String(h)) || !Number.isInteger(s) || s < 0 || s > CHUNK_MAX) throw badRequest('invalid chunk');
+      const bytes = body.subarray(offset, offset + s);
+      offset += s;
+      if (bytes.length !== s || sha256(bytes) !== h) throw badRequest('chunk content does not match its hash');
+      return { h, bytes };
+    });
+    if (offset !== body.length) throw badRequest('body size does not match the chunk list');
+    await mapLimit(parts, 48, ({ h, bytes }) => this.blobs.put(h, bytes));
+    return { stored: parts.length };
+  }
+
+  /** Chunk lists for versions the caller can read. */
+  async manifests(uid, items) {
+    if (!Array.isArray(items) || items.length > 500) throw badRequest('items required');
+    const out = [];
+    for (const { artifactId, version } of items) {
+      const { artifact: a } = await this.access(uid, artifactId);
+      if (a.kind !== 'file') throw badRequest('folders have no content');
+      const s = await this.versionState(a, version);
+      out.push({ artifactId, version: s.version, blob: s.blob, size: s.size ?? 0, chunks: this.manifestOf(s) });
+    }
+    return out;
+  }
+
+  /** Bytes of the requested chunks of one version, concatenated in request order. */
+  async fetchChunks(uid, { artifactId, version, hashes }) {
+    const { artifact: a } = await this.access(uid, artifactId);
+    const s = await this.versionState(a, version);
+    const inManifest = new Map(this.manifestOf(s).map((c) => [c.h, c.s]));
+    if (!Array.isArray(hashes) || !hashes.length) throw badRequest('hashes required');
+    let total = 0;
+    for (const h of hashes) {
+      if (!inManifest.has(h)) throw forbidden('chunk is not part of this version');
+      total += inManifest.get(h);
+    }
+    if (total > FETCH_LIMIT && hashes.length > 1) throw tooLarge('request fewer chunks at a time');
+    return Buffer.concat(await mapLimit(hashes, 64, (h) => this.blobs.read(h)));
   }
 
   async downloadUrls(uid, items) {
     const out = [];
     for (const { artifactId, version } of items ?? []) {
       const { artifact: a } = await this.access(uid, artifactId);
-      let sha = a.blob;
-      if (version !== undefined && version !== a.currentVersion) {
-        const v = await this.store.version(a._id, Number(version));
-        if (!v) throw notFound(`version ${version} not found`);
-        sha = v.blob;
-      }
+      const s = await this.versionState(a, version);
+      const sha = s.blob;
       if (!sha) throw badRequest('nothing to download');
-      out.push({ artifactId, version: version ?? a.currentVersion, sha256: sha, url: await this.blobs.downloadUrl(sha) });
+      // Older clients download whole files: assemble chunked content once, on demand.
+      if (s.chunks && !(await this.blobs.has(sha))) await this.blobs.put(sha, await this.assemble(s));
+      out.push({ artifactId, version: s.version, sha256: sha, url: await this.blobs.downloadUrl(sha) });
     }
     return out;
   }

@@ -2,7 +2,17 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import crypto from 'node:crypto';
-import { sha256 } from '@tether/shared';
+import { sha256, chunkContent } from '@tether/shared';
+
+const PUT_BATCH_BYTES = 1024 * 1024;
+const PUT_PARALLEL = 4; // batches in flight at once
+const PUT_BATCH_CHUNKS = 100; // the chunk list travels in a header
+const FETCH_BATCH_BYTES = 1024 * 1024;
+const FETCH_PARALLEL = 4; // fetches in flight at once
+const kb = (n) => (n < 1024 ? `${n} B` : n < 1048576 ? `${Math.round(n / 1024)} KB` : `${(n / 1048576).toFixed(1)} MB`);
+
+/** Human summary of a delta transfer, e.g. "sent 2 of 540 chunks, 17 KB". */
+export const describeTransfer = (t, verb) => (t ? `${verb} ${t.moved} of ${t.total} chunk${t.total === 1 ? '' : 's'}, ${kb(t.bytes)}` : '');
 
 export class ApiError extends Error {
   constructor(status, body) {
@@ -39,6 +49,41 @@ export class Api {
     this.config = config;
     this.credentials = credentials;
     this.accessToken = null;
+    this.manifests = new Map(); // content sha -> chunk list, from the last upload of that content
+    this.transfers = new Map(); // content sha -> { moved, total, bytes } of the last transfer
+  }
+
+  /** Authenticated POST with a binary body or a binary response; refreshes the token once on 401. */
+  async binary(p, { json, body, headers = {} }) {
+    const send = async (token) => {
+      let res;
+      try {
+        res = await fetch(this.base + '/v1' + p, {
+          method: 'POST',
+          headers: { authorization: `Bearer ${token}`, 'content-type': json ? 'application/json' : 'application/octet-stream', ...headers },
+          body: json ? JSON.stringify(json) : body,
+          signal: AbortSignal.timeout(180000),
+        });
+      } catch (e) {
+        throw new OfflineError(`cannot reach the Tether server at ${this.base} (${e.cause?.code ?? e.message})`);
+      }
+      if (!res.ok) throw new ApiError(res.status, (await res.json().catch(() => ({}))).error);
+      return Buffer.from(await res.arrayBuffer());
+    };
+    try {
+      return await send(await this.token());
+    } catch (e) {
+      if (e instanceof ApiError && e.status === 401 && this.accessToken) {
+        this.accessToken = null;
+        return send(await this.token());
+      }
+      throw e;
+    }
+  }
+
+  /** The chunk list to commit for content uploaded by uploadBlobs (undefined on old servers). */
+  manifestFor(sha) {
+    return this.manifests.get(sha);
   }
 
   get base() {
@@ -161,10 +206,59 @@ export class Api {
     this.accessToken = null;
   }
 
-  /** Uploads canonical blobs the server doesn't have yet. blobs: [{ sha256, bytes }] */
-  async uploadBlobs(blobs) {
-    const unique = [...new Map(blobs.map((b) => [b.sha256, b])).values()];
-    if (!unique.length) return;
+  /**
+   * Uploads content as chunks (delta sync): every file is split into content-defined chunks and
+   * only the chunks the server does not have are sent. blobs: [{ sha256, bytes }] (canonical).
+   * Afterwards manifestFor(sha) gives each file's chunk list for the commit.
+   */
+  async uploadBlobs(blobs, { artifactId } = {}) {
+    const files = [...new Map(blobs.map((b) => [b.sha256, b])).values()];
+    if (!files.length) return;
+    const all = new Map(); // chunk hash -> bytes
+    for (const f of files) {
+      const parts = chunkContent(f.bytes);
+      this.manifests.set(f.sha256, parts.map(({ h, s }) => ({ h, s })));
+      for (const c of parts) all.set(c.h, c.bytes);
+    }
+    let missing;
+    try {
+      ({ missing } = await this.call('POST', '/chunks/missing', { hashes: [...all.keys()], artifactId }));
+    } catch (e) {
+      if (!(e instanceof ApiError && e.status === 404)) throw e;
+      for (const f of files) this.manifests.delete(f.sha256); // server without delta sync
+      return this.uploadWhole(files);
+    }
+    const batches = [];
+    let batch = [];
+    let size = 0;
+    for (const h of missing) {
+      const bytes = all.get(h);
+      if (batch.length && (batch.length >= PUT_BATCH_CHUNKS || size + bytes.length > PUT_BATCH_BYTES)) {
+        batches.push(batch);
+        batch = [];
+        size = 0;
+      }
+      batch.push({ h, bytes });
+      size += bytes.length;
+    }
+    if (batch.length) batches.push(batch);
+    let next = 0;
+    await Promise.all(Array.from({ length: Math.min(PUT_PARALLEL, batches.length) }, async () => {
+      while (next < batches.length) {
+        const b = batches[next++];
+        await this.binary('/chunks/put', { body: Buffer.concat(b.map((c) => c.bytes)), headers: { 'x-tether-chunks': b.map((c) => `${c.h}:${c.bytes.length}`).join(',') } });
+      }
+    }));
+    const sent = new Set(missing);
+    for (const f of files) {
+      const m = this.manifests.get(f.sha256);
+      const moved = m.filter((c) => sent.has(c.h));
+      this.transfers.set(f.sha256, { moved: moved.length, total: m.length, bytes: moved.reduce((a, c) => a + c.s, 0) });
+    }
+  }
+
+  /** Whole-file upload through signed URLs, for servers without delta sync. */
+  async uploadWhole(unique) {
     const { upload } = await this.call('POST', '/blobs/upload', { blobs: unique.map((b) => ({ sha256: b.sha256, size: b.bytes.length })) });
     const bySha = new Map(unique.map((b) => [b.sha256, b]));
     for (const u of upload) {
@@ -174,10 +268,64 @@ export class Api {
     }
   }
 
-  /** Downloads blobs for [{ artifactId, version? }] into the cache; skips blobs already cached. */
+  /**
+   * Downloads content into the cache, by chunks (delta sync). items: [{ artifactId, version, sha,
+   * base? }] where base is content already cached (usually the version on disk): its chunks are
+   * reused, so only chunks that changed are downloaded.
+   */
   async fetchBlobs(cache, items) {
-    if (!items.length) return [];
-    const { downloads } = await this.call('POST', '/blobs/download', { items });
+    const need = [...new Map(items.filter((i) => !i.sha || !cache.has(i.sha)).map((i) => [`${i.artifactId}@${i.version}`, i])).values()];
+    if (!need.length) return;
+    let manifests;
+    try {
+      ({ manifests } = await this.call('POST', '/chunks/manifest', { items: need.map(({ artifactId, version }) => ({ artifactId, version })) }));
+    } catch (e) {
+      if (!(e instanceof ApiError && e.status === 404)) throw e;
+      return this.fetchWhole(cache, need); // server without delta sync
+    }
+    for (const [k, m] of manifests.entries()) {
+      if (cache.has(m.blob)) continue;
+      const local = new Map();
+      const base = need[k].base;
+      if (base && cache.has(base)) for (const c of chunkContent(cache.get(base))) local.set(c.h, c.bytes);
+      const size = new Map(m.chunks.map((c) => [c.h, c.s]));
+      const want = [...size.keys()].filter((h) => !local.has(h));
+      let bytesIn = 0;
+      const batches = [];
+      for (let i = 0; i < want.length; ) {
+        const batch = [];
+        let total = 0;
+        while (i < want.length && (!batch.length || total + size.get(want[i]) <= FETCH_BATCH_BYTES)) {
+          batch.push(want[i]);
+          total += size.get(want[i++]);
+        }
+        batches.push(batch);
+        bytesIn += total;
+      }
+      let next = 0;
+      await Promise.all(Array.from({ length: Math.min(FETCH_PARALLEL, batches.length) }, async () => {
+        while (next < batches.length) {
+          const batch = batches[next++];
+          const buf = await this.binary('/chunks/fetch', { json: { artifactId: m.artifactId, version: m.version, hashes: batch } });
+          let off = 0;
+          for (const h of batch) {
+            const bytes = buf.subarray(off, off + size.get(h));
+            off += size.get(h);
+            if (sha256(bytes) !== h) throw new Error('downloaded chunk does not match its hash');
+            local.set(h, Buffer.from(bytes));
+          }
+        }
+      }));
+      const content = Buffer.concat(m.chunks.map((c) => local.get(c.h)));
+      if (sha256(content) !== m.blob) throw new Error('downloaded content does not match its hash');
+      cache.put(m.blob, content);
+      this.transfers.set(m.blob, { moved: want.length, total: size.size, bytes: bytesIn });
+    }
+  }
+
+  /** Whole-file downloads through signed URLs, for servers without delta sync. */
+  async fetchWhole(cache, items) {
+    const { downloads } = await this.call('POST', '/blobs/download', { items: items.map(({ artifactId, version }) => ({ artifactId, version })) });
     for (const d of downloads) {
       if (cache.has(d.sha256)) continue;
       const res = await fetch(d.url);

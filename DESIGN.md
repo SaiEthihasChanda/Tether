@@ -322,7 +322,7 @@ tether config get|set <key> [<value>]                 # tick interval, eol defau
 
 - **Polling cost and Firebase quotas/pricing:** cost of a 30 s tick per client, function invocations, Storage egress. Cloud Storage now effectively requires the Blaze plan; check current pricing before launch. The batched per-tick call (§6.1) is the first mitigation.
 - **Push notifications instead of polling:** e.g. an FCM or long-poll channel.
-- **Delta sync** for larger files.
+- ~~Delta sync~~: done in 0.4.0, see §12d.
 - **History retention policy** and storage growth.
 
 ## 12a. Implementation notes (2026-10-14)
@@ -430,6 +430,44 @@ Behaviours the build had to settle where the design was silent:
 - **Grouping:** events are grouped over 3 seconds ("(+2 more)"), and repeats are rate-limited.
 - **Clicking:** opens the artifact or the console.
 - **Setting:** `notifications` = `all` | `errors` | `off`.
+
+## 12d. Delta sync (2026-10-19, 0.4.0)
+
+**Chunking.** Content is split into *content-defined chunks* before it travels. The splitter is a gear hash in the style of FastCDC: minimum 2 KB, target about 8 KB, maximum 64 KB. Boundaries come from the bytes themselves, so an edit changes only the chunks around it, even when text is inserted or removed earlier in the file. A small edit in a 1 MB file changes at most a few chunks out of more than 100. Chunking runs on the canonical bytes (LF, no BOM), so line-ending differences never cost a transfer.
+
+**A version is a chunk list.** Each version stores a chunk list, `[{ h: sha256, s: size }]`, next to the whole-content hash, which stays the content's identity. Chunks are stored content-addressed in the same blob store, so versions, artifacts and repositories share them.
+
+**Pushing:**
+1. `POST /v1/chunks/missing` with the chunk hashes; the server answers with the ones it lacks.
+2. Only those are uploaded, with `POST /v1/chunks/put`. Uploads are batched (at most 4 MB or 100 chunks per request), and the server hashes every chunk before storing it.
+3. The commit carries `{ blob, size, chunks }`. The server checks that the sizes add up and that every chunk not already in the previous version exists.
+
+**Pulling:**
+1. `POST /v1/chunks/manifest` gives the new version's chunk list.
+2. The client re-chunks the version it already has (its base) and reuses every chunk that matches.
+3. `POST /v1/chunks/fetch` downloads only the rest, batched at up to 8 MB. Fetches are limited to chunks of versions the caller can read.
+4. The reassembled file is verified against its whole-content hash.
+
+**No signed URLs per chunk.** Chunks move through the API: signing hundreds of URLs would cost more than the transfer saves.
+
+**Compatibility:**
+- Clients before 0.4.0 still upload whole files; such a version is treated as a single chunk.
+- When an old client downloads, the server assembles the whole file once and stores it.
+- New clients fall back to whole files against a server without the chunk endpoints.
+- The console preview reads assembled content.
+
+**Visible to users.** The push result and the daemon log report the transfer, e.g. `push big.txt -> v2 (sent 1 of 241 chunks, 9 KB)` and `updated to version 2 (received 1 of 241 chunks, 9 KB)`.
+
+**Storage location.** Chunks are stored in a bucket in the API's region (`tether-b10cf-data`, asia-south1). The default Firebase bucket is in us-east1, and per-chunk lookups across continents made pushes about 5x slower. Content in the old bucket stays readable, and chunks read from it are copied over in the background.
+
+**Measured on the live service** (a 5 MB file):
+- **One-line edit:** push about 2.3 s, receive about 1.5 s; one chunk of 4-15 KB travels instead of 5 MB.
+- **First upload:** about 11 s.
+- **First pull:** about 6 s.
+
+**Not yet:**
+- Unreferenced chunks are not garbage-collected (history retention, §12).
+- A client reuses chunks only from the version it has on disk, not from other cached versions.
 
 ## 13. Open questions
 

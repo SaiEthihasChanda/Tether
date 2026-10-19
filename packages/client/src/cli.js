@@ -89,7 +89,7 @@ async function resolveFlow(p, from, opts) {
   }
   const { results } = await daemon('resolve', { path: target, from, items: plan.items, choices });
   for (const r of results) {
-    const extra = r.error ? `  ERROR: ${r.error}` : r.version ? `  -> v${r.version}` : r.keptAs ? `  (your copy: ${r.keptAs})` : r.released ? `  (left at ${r.released})` : '';
+    const extra = r.error ? `  ERROR: ${r.error}` : r.version ? `  -> v${r.version}${r.sent ? ` (${r.sent})` : ''}` : r.keptAs ? `  (your copy: ${r.keptAs})` : r.released ? `  (left at ${r.released})` : '';
     out(`${r.action.padEnd(9)} ${r.path}${extra}`);
   }
   if (results.some((r) => r.error)) process.exitCode = 1;

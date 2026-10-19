@@ -31,7 +31,7 @@ test('realtime pushes every save without `tether done`', async () => {
   assert.ok((await inst(ann, 'live.md')).flags.some((f) => /realtime: your saves are pushed live/.test(f)));
   ann.write('live.md', 'one\ntwo\n');
   // No sync call: ann's daemon pushes by itself after the save.
-  await eventually(async () => /pushed v2 \(realtime\)/.test(await ann.log()), { timeout: 8000, message: 'live push' });
+  await eventually(async () => /pushed v2 \(realtime/.test(await ann.log()), { timeout: 8000, message: 'live push' });
   await owner.sync();
   assert.equal(lf(owner.read('live.md')), 'one\ntwo\n');
 });

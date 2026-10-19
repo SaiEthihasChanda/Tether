@@ -54,6 +54,8 @@ tether config set notifications errors    # desktop notifications: all | errors 
 
 Use `--git keep|follow|skip` to skip the question, and change it later with `tether git <path> --mode`. Nothing is added to the repository; DESIGN.md §12c has the details.
 
+**Delta sync.** Pushes and pulls send only the parts of a file that changed: files are split into content-defined chunks and only missing chunks travel. `tether done` and the daemon log report it, for example `sent 1 of 241 chunks, 9 KB`. See DESIGN.md §12d.
+
 **Notifications.** The daemon shows desktop notifications (Windows toasts, or `notify-send` on Linux) for:
 - reverted changes (grouped)
 - conflicts and failed pushes
@@ -113,7 +115,7 @@ The server has two backends. Both use the same rules in `service.js`.
 | Part | `local` (dev, tests) | `firebase` (production) |
 |---|---|---|
 | Metadata | `store/mongo.js` (MongoDB) | `store/firestore.js` (Firestore; compare-and-set via transactions) |
-| Content | `blobs/fs.js` (HMAC-signed URLs) | `blobs/gcs.js` (Cloud Storage v4 signed URLs: create-only, size-capped; sha256 verified on first use) |
+| Content | `blobs/fs.js` | `blobs/gcs.js`: chunks in bucket `tether-b10cf-data` (asia-south1, next to the API); older content still read from the default bucket and moved over when read |
 | Sign-in | `auth/local.js` (email + password) | `auth/firebase.js` (ID tokens; custom tokens for the CLI browser login) |
 | Runs as | `npm run server` | Cloud Function (`src/functions.js`, bundled to `firebase/functions/lib`) |
 
@@ -123,5 +125,5 @@ Firestore and Storage security rules deny all direct client access: every read a
 
 - **Linux:** the `fanotify` root helper is not built (the trial is deferred). Linux uses the no-root scan tracker, which is tested on Windows via `TETHER_TRACKER=scan` but not yet on a Linux kernel.
 - **Linux credentials** are stored in a file with mode 0600, not yet in Secret Service. Windows uses DPAPI.
-- **Deferred in DESIGN §12:** polling cost, push notifications, delta sync, history retention, and blob garbage collection. Each client calls the function once per tick (30 s by default). That is fine at small scale; watch the Cloud Functions bill as usage grows.
+- **Deferred in DESIGN §12:** polling cost, push notifications, history retention, and garbage collection of unused content. Each client calls the function once per tick (30 s by default). That is fine at small scale; watch the Cloud Functions bill as usage grows.
 - The console doesn't load Google Analytics, even though the Firebase snippet includes it.

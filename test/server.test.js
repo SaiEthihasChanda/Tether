@@ -198,3 +198,35 @@ test('repo transfer, purge, and account deletion', async () => {
   const [g] = (await viewer.call('POST', '/sync/check', { items: [{ artifactId: t.artifactId, version: 1 }] })).results;
   assert.equal(g.status, 'gone');
 });
+
+test('delta sync: chunk uploads are verified and fetches are limited to readable versions', async () => {
+  const { sha256, chunkContent } = await import('../packages/shared/src/index.js');
+  const bytes = Buffer.from('x'.repeat(800) + 'chunked content\n'); // this test server caps files at 1 KB
+  const parts = chunkContent(bytes);
+  const put = (u, list, body) => fetch(`${srv.url}/v1/chunks/put`, {
+    method: 'POST',
+    headers: { authorization: `Bearer ${u.token}`, 'content-type': 'application/octet-stream', 'x-tether-chunks': list.map((c) => `${c.h}:${c.s}`).join(',') },
+    body,
+  });
+  // a chunk whose bytes do not match its hash is refused
+  assert.equal((await put(owner, [{ h: 'a'.repeat(64), s: 3 }], Buffer.from('abc'))).status, 400);
+  const { missing } = await owner.call('POST', '/chunks/missing', { hashes: parts.map((c) => c.h) });
+  assert.equal(missing.length, new Set(parts.map((c) => c.h)).size);
+  // committing before the chunks exist fails
+  const manifest = parts.map(({ h, s }) => ({ h, s }));
+  await rejects(owner.call('POST', '/artifacts', { repoId: repo.repoId, kind: 'file', name: 'chunked.txt', blob: sha256(bytes), size: bytes.length, chunks: manifest }), 400);
+  assert.equal((await put(owner, parts, Buffer.concat(parts.map((c) => c.bytes)))).status, 200);
+  assert.deepEqual((await owner.call('POST', '/chunks/missing', { hashes: parts.map((c) => c.h) })).missing, []);
+  await rejects(owner.call('POST', '/artifacts', { repoId: repo.repoId, kind: 'file', name: 'chunked.txt', blob: sha256(bytes), size: bytes.length + 1, chunks: manifest }), 400);
+  const { artifact } = await owner.call('POST', '/artifacts', { repoId: repo.repoId, kind: 'file', name: 'chunked.txt', blob: sha256(bytes), size: bytes.length, chunks: manifest });
+  const fetchChunks = (u, body) => fetch(`${srv.url}/v1/chunks/fetch`, { method: 'POST', headers: { authorization: `Bearer ${u.token}`, 'content-type': 'application/json' }, body: JSON.stringify(body) });
+  const got = await fetchChunks(owner, { artifactId: artifact.artifactId, hashes: [parts[0].h] });
+  assert.deepEqual(Buffer.from(await got.arrayBuffer()), parts[0].bytes);
+  // not shared with the stranger; and a hash outside the manifest is refused even for the owner
+  assert.equal((await fetchChunks(stranger, { artifactId: artifact.artifactId, hashes: [parts[0].h] })).status, 404);
+  assert.equal((await fetchChunks(owner, { artifactId: artifact.artifactId, hashes: ['b'.repeat(64)] })).status, 403);
+  // whole-file readers (console preview, older clients) get the assembled content
+  const content = await fetch(`${srv.url}/v1/artifacts/${artifact.artifactId}/content`, { headers: { authorization: `Bearer ${owner.token}` } });
+  assert.equal(Buffer.from(await content.arrayBuffer()).toString(), bytes.toString());
+  assert.equal(await owner.download(artifact.artifactId), bytes.toString());
+});

@@ -4,7 +4,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { createTwoFilesPatch } from 'diff';
 import { canonicalize, sha256, resolveEol, newInstanceId, nameError, relPathError, caseCollisionError, isBinary } from '@tether/shared';
-import { ApiError, OfflineError } from './api.js';
+import { ApiError, OfflineError, describeTransfer } from './api.js';
 import { findRepo, gitBusy, removeHooks, GIT_MODES, gitBinary, head, changeFromGit, changesBetween, setKeep, isKept, restage, isAncestor, isTracked, fileBlob, blobAt, indexBlob } from './git.js';
 import {
   readLocal, writeLocal, styleOf, LockedError, keepBothName, moveFile, pruneEmptyDirs, walkFiles,
@@ -68,9 +68,23 @@ export class Engine {
     return this.cache.get(sha);
   }
 
+  /** Downloads content not yet cached; `base` (content already here) lets only changed chunks travel. */
   async ensureBlobs(pairs) {
     const missing = pairs.filter((p) => p.sha && !this.cache.has(p.sha));
-    if (missing.length) await this.api.fetchBlobs(this.cache, missing.map(({ artifactId, version }) => ({ artifactId, version })));
+    if (missing.length) await this.api.fetchBlobs(this.cache, missing);
+  }
+
+  /** Uploads content (only chunks the server lacks) and returns the commit fields for it. */
+  async uploadContent(local, artifactId) {
+    await this.api.uploadBlobs([{ sha256: local.hash, bytes: local.canonical }], { artifactId });
+    this.cache.put(local.hash, local.canonical);
+    return { blob: local.hash, size: local.canonical.length, chunks: this.api.manifestFor(local.hash) };
+  }
+
+  /** ", sent 2 of 540 chunks, 17 KB" for log lines (empty when nothing is known). */
+  sentNote(sha) {
+    const t = describeTransfer(this.api.transfers.get(sha), 'sent');
+    return t ? `; ${t}` : '';
   }
 
   /** Writes content for an instance at `p`; records the result for the quick change check. */
@@ -296,18 +310,15 @@ export class Engine {
       }
       try {
         const change = { gitCommit: commit ?? null };
-        if (local) {
-          await this.api.uploadBlobs([{ sha256: local.hash, bytes: local.canonical }]);
-          this.cache.put(local.hash, local.canonical);
-          Object.assign(change, { blob: local.hash, size: local.canonical.length });
-        }
+        if (local) Object.assign(change, await this.uploadContent(local, inst.artifactId));
         if (relPath !== undefined) change.relPath = relPath;
         const c = await this.api.call('POST', `/artifacts/${inst.artifactId}/commit`, { baseVersion: inst.baseVersion, change });
         this.db.update(inst.instanceId, {
           baseVersion: c.version, remoteVersion: c.version, baseHash: hash, relPath: relPath ?? inst.relPath, gitWaiting: false, lastError: null,
           ...(local ? { size: local.size, mtimeMs: local.mtimeMs, ...styleOf(local) } : {}),
         });
-        this.log(`${inst.path}: published git's version as v${c.version}`);
+        const sent = local ? describeTransfer(this.api.transfers.get(local.hash), 'sent') : '';
+        this.log(`${inst.path}: published git's version as v${c.version}${sent ? ` (${sent})` : ''}`);
         this.notify({ kind: 'git-published', level: 'info', title: "Published git's changes", body: `${name} is now v${c.version} for everyone who has it.`, short: name, artifactId: inst.artifactId });
       } catch (e) {
         if (e instanceof ApiError && e.status === 409) conflict();
@@ -375,7 +386,7 @@ export class Engine {
         const local = readLocal(cur.path, cur.eolMode);
         if (r.status === 'changed') {
           if (!local || local.hash === cur.baseHash) {
-            await this.ensureBlobs([{ artifactId: cur.artifactId, version: r.state.version, sha: r.state.blob }]);
+            await this.ensureBlobs([{ artifactId: cur.artifactId, version: r.state.version, sha: r.state.blob, base: cur.baseHash }]);
             this.applyIncoming(cur, r.state);
           } else {
             if (!cur.lastError?.startsWith('conflict')) {
@@ -387,12 +398,11 @@ export class Engine {
           continue;
         }
         if (!local || local.hash === cur.baseHash) continue;
-        await this.api.uploadBlobs([{ sha256: local.hash, bytes: local.canonical }]);
-        this.cache.put(local.hash, local.canonical);
+        const content = await this.uploadContent(local, cur.artifactId);
         try {
-          const c = await this.api.call('POST', `/artifacts/${cur.artifactId}/commit`, { baseVersion: cur.baseVersion, change: { blob: local.hash, size: local.canonical.length } });
+          const c = await this.api.call('POST', `/artifacts/${cur.artifactId}/commit`, { baseVersion: cur.baseVersion, change: content });
           this.db.update(cur.instanceId, { baseVersion: c.version, remoteVersion: c.version, baseHash: local.hash, size: local.size, mtimeMs: local.mtimeMs, ...styleOf(local), lastError: null });
-          this.log(`${cur.path}: pushed v${c.version} (realtime)`);
+          this.log(`${cur.path}: pushed v${c.version} (realtime${this.sentNote(local.hash)})`);
         } catch (e) {
           if (!(e instanceof ApiError && e.status === 409)) throw e;
           this.db.update(cur.instanceId, { lastError: 'conflict: the server changed; run `tether done` to resolve' });
@@ -562,7 +572,7 @@ export class Engine {
     }
     try {
       await this.ensureBlobs([
-        ...incoming.map(({ state }) => ({ artifactId: state.artifactId, version: state.version, sha: state.blob })),
+        ...incoming.map(({ inst, state }) => ({ artifactId: state.artifactId, version: state.version, sha: state.blob, base: inst.baseHash })),
         ...newChildren.map(({ child }) => ({ artifactId: child.artifactId, version: child.version, sha: child.blob })),
       ]);
     } catch (e) {
@@ -612,7 +622,9 @@ export class Engine {
       const localEdit = !this.matchesBase(inst, p) && readLocal(p, inst.eolMode)?.hash !== state.blob;
       if (state.blob !== inst.baseHash || localEdit) {
         Object.assign(patch, this.writeInstance(inst, p, state.blob, state.eol, state.exec));
-        this.log(`${p}: updated to version ${state.version}${localEdit ? ' (local change replaced)' : ''}`);
+        const got = describeTransfer(this.api.transfers.get(state.blob), 'received');
+        this.api.transfers.delete(state.blob);
+        this.log(`${p}: updated to version ${state.version}${localEdit ? ' (local change replaced)' : ''}${got ? ` (${got})` : ''}`);
         if (inst.gitMode === 'follow' && inst.gitRoot && !state.gitCommit && blobAt(inst.gitRoot, 'HEAD', p) !== fileBlob(inst.gitRoot, p)) {
           // A version that exists only in Tether: hide it from git (like keep mode) so it never
           // blocks a pull. When git next changes the file, git's version wins (follow).
@@ -787,7 +799,7 @@ export class Engine {
     if (st.isFile()) {
       const f = this.prepareFile(abs, name, rules, eol);
       await this.api.uploadBlobs([f]);
-      const r = await this.api.call('POST', '/artifacts', { repoId: repo.repoId, kind: 'file', name, blob: f.sha256, size: f.size, eol: f.eol, exec: f.exec });
+      const r = await this.api.call('POST', '/artifacts', { repoId: repo.repoId, kind: 'file', name, blob: f.sha256, size: f.size, chunks: this.api.manifestFor(f.sha256), eol: f.eol, exec: f.exec });
       this.cache.put(f.sha256, f.bytes);
       const local = readLocal(abs, f.eol);
       this.db.insert({
@@ -810,7 +822,7 @@ export class Engine {
     await this.api.uploadBlobs(prepared);
     const r = await this.api.call('POST', '/artifacts', {
       repoId: repo.repoId, kind: 'folder', name,
-      files: prepared.map((f) => ({ relPath: f.rel, blob: f.sha256, size: f.size, eol: f.eol, exec: f.exec })),
+      files: prepared.map((f) => ({ relPath: f.rel, blob: f.sha256, size: f.size, chunks: this.api.manifestFor(f.sha256), eol: f.eol, exec: f.exec })),
     });
     const folderInst = this.db.insert({
       instanceId: newInstanceId(), artifactId: r.artifact.artifactId, kind: 'folder', repoId: repo.repoId, name, path: abs,
@@ -844,7 +856,7 @@ export class Engine {
     const repo = (await this.api.call('GET', '/repos')).find((r) => r.repoId === folder.repoId);
     const f = this.prepareFile(abs, rel, repo?.eolDefaults ?? {});
     await this.api.uploadBlobs([f]);
-    const child = await this.api.call('POST', `/artifacts/${folder.artifactId}/children`, { relPath: rel, blob: f.sha256, size: f.size, eol: f.eol, exec: f.exec, gitCommit });
+    const child = await this.api.call('POST', `/artifacts/${folder.artifactId}/children`, { relPath: rel, blob: f.sha256, size: f.size, chunks: this.api.manifestFor(f.sha256), eol: f.eol, exec: f.exec, gitCommit });
     this.cache.put(f.sha256, f.bytes);
     const local = readLocal(abs, f.eol);
     this.db.insert({
@@ -1154,11 +1166,7 @@ export class Engine {
       case 'push': {
         const local = readLocal(inst.path, inst.eolMode);
         const change = {};
-        if (local && local.hash !== inst.baseHash) {
-          await this.api.uploadBlobs([{ sha256: local.hash, bytes: local.canonical }]);
-          this.cache.put(local.hash, local.canonical);
-          Object.assign(change, { blob: local.hash, size: local.canonical.length });
-        }
+        if (local && local.hash !== inst.baseHash) Object.assign(change, await this.uploadContent(local, inst.artifactId));
         if (folder) {
           const rel = this.localRel(inst, folder);
           if (rel && rel !== inst.relPath) change.relPath = rel;
@@ -1174,7 +1182,7 @@ export class Engine {
           mode: 'normal', baseVersion: r.version, remoteVersion: r.version, baseHash: state?.blob ?? inst.baseHash,
           relPath: state?.relPath ?? inst.relPath, size: local?.size ?? null, mtimeMs: local?.mtimeMs ?? null, ...(local ? styleOf(local) : {}),
         });
-        return { version: r.version };
+        return { version: r.version, sent: change.blob ? describeTransfer(this.api.transfers.get(change.blob), 'sent') : '' };
       }
       case 'delete': {
         await this.api.call('POST', `/artifacts/${inst.artifactId}/commit`, { baseVersion: item.serverVersion, change: { deleted: true } });
@@ -1201,7 +1209,7 @@ export class Engine {
     if (!inst || inst.kind !== 'file') throw new UserError('diff needs a managed file');
     const { artifact } = await this.api.call('GET', `/artifacts/${inst.artifactId}`);
     if (artifact.deleted) throw new UserError('the artifact has been deleted on the server');
-    await this.ensureBlobs([{ artifactId: inst.artifactId, version: artifact.version, sha: artifact.blob }]);
+    await this.ensureBlobs([{ artifactId: inst.artifactId, version: artifact.version, sha: artifact.blob, base: inst.baseHash }]);
     const server = this.cache.get(artifact.blob);
     const local = inst.detached ? null : readLocal(inst.path, inst.eolMode);
     const label = path.basename(inst.path);

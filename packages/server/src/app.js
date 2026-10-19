@@ -59,6 +59,22 @@ export function createApp({ service, auth, consoleDir, maxFileSize }) {
   api.delete('/repos/:id', async (req, res) => res.json(await service.deleteRepo(req.uid, req.params.id)));
   api.post('/repos/:id/transfer', async (req, res) => res.json(await service.transferRepo(req.uid, req.params.id, req.body.to)));
 
+  // chunks (delta sync)
+  api.post('/chunks/missing', async (req, res) => res.json({ missing: await service.chunksMissing(req.uid, req.body.hashes, req.body.artifactId) }));
+  api.post('/chunks/put', express.raw({ type: 'application/octet-stream', limit: 16 * 1024 * 1024 }), async (req, res) => {
+    const body = Buffer.isBuffer(req.body) ? req.body : (req.rawBody ?? Buffer.alloc(0));
+    const entries = String(req.get('x-tether-chunks') || '').split(',').filter(Boolean).map((e) => {
+      const [h, s] = e.split(':');
+      return { h, s: Number(s) };
+    });
+    res.json(await service.putChunks(entries, body));
+  });
+  api.post('/chunks/manifest', async (req, res) => res.json({ manifests: await service.manifests(req.uid, req.body.items) }));
+  api.post('/chunks/fetch', async (req, res) => {
+    res.set('content-type', 'application/octet-stream');
+    res.send(await service.fetchChunks(req.uid, req.body));
+  });
+
   // blobs
   api.post('/blobs/upload', async (req, res) => res.json({ upload: await service.blobsToUpload(req.body.blobs) }));
   api.post('/blobs/download', async (req, res) => res.json({ downloads: await service.downloadUrls(req.uid, req.body.items) }));

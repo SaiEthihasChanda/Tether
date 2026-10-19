@@ -1,2 +1,2 @@
 // The client version. Must match packages/client/package.json (the npm build checks it).
-export const VERSION = '0.3.0';
+export const VERSION = '0.4.0';

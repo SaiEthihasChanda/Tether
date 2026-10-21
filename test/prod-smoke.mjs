@@ -44,6 +44,14 @@ try {
   assert.equal(lf(bob.read('cfg.txt')), 'v2\n');
   step('owner edit pushed and received');
 
+  await eventually(async () => /push channel connected/.test(await bob.log()), { timeout: 20000, message: 'push channel' });
+  await owner.run(['edit', 'cfg.txt']);
+  owner.write('cfg.txt', 'pushed\n');
+  await owner.run(['done', 'cfg.txt']);
+  const tp = Date.now();
+  await eventually(() => lf(bob.read('cfg.txt')) === 'pushed\n', { timeout: 15000, message: 'pushed change without a sync' });
+  step(`push: the change reached the other client in ${Date.now() - tp} ms with no sync and no polling`);
+
   await owner.run(['share', 'cfg.txt', '--editor', accounts.bob]);
   await bob.sync();
   await owner.run(['edit', 'cfg.txt']);
@@ -57,7 +65,7 @@ try {
   step('conflict detected by the Firestore transaction; keep-both worked');
 
   const h = (await owner.run(['history', 'cfg.txt'])).stdout;
-  assert.match(h, /v3 /);
+  assert.match(h, /v4 /);
   await owner.run(['rollback', 'cfg.txt', '--to', '1']);
   await bob.sync();
   assert.equal(lf(bob.read('cfg.txt')), 'v1\n');

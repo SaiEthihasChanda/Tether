@@ -150,6 +150,9 @@ test('B9: cherry-pick is published', async () => {
 test('C3: git and Tether both changed it -> stays in editing, notified', async () => {
   git(owner.p('repo'), 'pull', '-q'); // the owner catches up through git first
   await owner.sync();
+  // ann must not see Tether's version before her pull (with push it would arrive within a second)
+  await ann.ipc('shutdown');
+  await new Promise((r) => setTimeout(r, 500));
   // A Tether-side edit made from a copy outside git (e.g. someone without the repository).
   await owner.run(['pull', cfgId, 'plain/cfg.json']);
   await owner.run(['edit', 'plain/cfg.json']);
@@ -160,8 +163,6 @@ test('C3: git and Tether both changed it -> stays in editing, notified', async (
   assert.equal(lf(owner.read('repo/cfg.json')), '{ "v": "tether" }\n');
   assert.ok((await inst(owner, 'repo/cfg.json')).flags.includes('Tether-only version (hidden from git)'));
   assert.ok(clean(owner));
-  await ann.ipc('shutdown'); // ann must not see Tether's version before her pull
-  await new Promise((r) => setTimeout(r, 500));
   upstream('cfg.json', '{ "v": "git" }\n');
   git(ann.p('repo'), 'pull', '-q');
   await ann.start();

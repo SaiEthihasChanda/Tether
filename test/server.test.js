@@ -171,6 +171,22 @@ test('change cursor: an unchanged check is cheap, every kind of change moves it'
   const oc = (await owner.call('POST', '/sync/check', { items: items(4) })).cursor;
   assert.equal((await owner.call('POST', '/sync/check', { items: items(4), cursor: oc })).unchanged, true);
 
+  // when the cursor moved, only what changed since it is looked up; files follow their folder
+  const p = await manageFile('cursor-p.txt', 'p\n');
+  const q = await manageFile('cursor-q.txt', 'q\n');
+  const pq = [{ artifactId: p.artifactId, version: 1 }, { artifactId: q.artifactId, version: 1, root: p.artifactId }];
+  const pc = (await owner.call('POST', '/sync/check', { items: pq })).cursor;
+  await owner.call('POST', `/artifacts/${p.artifactId}/commit`, { baseVersion: 1, change: await owner.upload('p2\n') });
+  r = await owner.call('POST', '/sync/check', { items: pq, cursor: pc });
+  assert.equal(r.partial, true);
+  assert.equal(r.results[0].status, 'changed');
+  assert.equal(r.results[1].status, 'ok'); // root changed: checked too
+  r = await owner.call('POST', '/sync/check', { items: [pq[0], { artifactId: q.artifactId, version: 1 }], cursor: pc });
+  assert.equal(r.results[1], null); // unrelated and unchanged: not looked up
+  // a cursor from the future or garbage gets a full answer
+  r = await owner.call('POST', '/sync/check', { items: pq, cursor: 1e9 });
+  assert.ok(r.results.every(Boolean));
+
   // realtime items always get a full answer (the check renews their lease)
   const b = await manageFile('cursor-live.txt', 'live\n');
   const bc = (await owner.call('POST', '/sync/check', { items: [{ artifactId: b.artifactId, version: 1 }] })).cursor;

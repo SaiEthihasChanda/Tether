@@ -86,7 +86,7 @@ export class TetherService {
       const fresh = await this.store.artifactById(a._id);
       throw conflict(`being edited in realtime by ${fresh.realtime?.email}`, { realtime: this.realtimeView(fresh.realtime, uid) });
     }
-    if (cur?.uid !== uid) await this.touch(root);
+    if (cur?.uid !== uid) await this.touch(root, { ids: [a._id] });
     return { realtime: this.realtimeView(session, uid) };
   }
 
@@ -95,7 +95,7 @@ export class TetherService {
     const { role, root } = await this.access(uid, artifactId);
     if (force && role !== 'owner') throw forbidden('only the owner can end someone else\'s realtime session');
     await this.store.releaseRealtime(artifactId, force ? null : uid);
-    await this.touch(root);
+    await this.touch(root, { ids: [artifactId] });
     return { ok: true };
   }
 
@@ -123,20 +123,25 @@ export class TetherService {
   }
 
   // ---- change feeds ----
-  // Each user has a counter that goes up whenever something they may hold a copy of changes.
-  // A client that saw counter N on its last full check, and still sees N, has nothing to fetch:
-  // its check costs one read instead of a few per file (see checkSince).
+  // Each user has a counter that goes up whenever something they may hold a copy of changes, and
+  // records the counter value at which each artifact last changed. A client that saw counter N on
+  // its last check, and still sees N, has nothing to fetch: its check costs one read. If the
+  // counter moved, only the artifacts that changed since N are looked up (see checkSince).
+  // Clients on Firebase also listen to their feed document, so they only check when it moves.
 
   /** Everyone who may hold a copy of root: owner, editors, allowlist and link grants. */
   async audience(root) {
     return [root.ownerUid, ...Object.keys(root.editors ?? {}), ...(root.allowlist ?? []), ...(await this.store.grantsFor(root._id))];
   }
 
-  /** Bumps the feeds of everyone who may hold root (plus `also`). Never fails the change itself. */
-  async touch(root, also = []) {
+  /**
+   * Bumps the feeds of everyone who may hold root (plus `also`), marking `ids` as changed (default:
+   * the root; a root change makes clients re-check the files inside it too). Never fails the change.
+   */
+  async touch(root, { also = [], ids = root ? [root._id] : [] } = {}) {
     try {
       const uids = [...new Set([...(root ? await this.audience(root) : []), ...also])].filter(Boolean);
-      await this.store.bumpFeeds(uids);
+      if (uids.length && ids.length) await this.store.bumpFeeds(uids, [...new Set(ids)]);
     } catch (e) {
       console.error('feed bump failed', e);
     }
@@ -303,11 +308,12 @@ export class TetherService {
   async deleteRepo(uid, repoId) {
     await this.requireRepoOwner(uid, repoId);
     const all = await this.store.artifactsInRepo(repoId);
-    const holders = (await Promise.all(all.filter((a) => !a.parentFolderId).map((a) => this.audience(a)))).flat();
+    const roots = all.filter((a) => !a.parentFolderId);
+    const holders = (await Promise.all(roots.map((a) => this.audience(a)))).flat();
     const ids = all.map((a) => a._id);
     await this.purgeArtifacts(ids);
     await this.store.deleteRepo(repoId);
-    await this.touch(null, holders);
+    await this.touch(null, { also: holders, ids: roots.map((a) => a._id) });
     return { purgedArtifacts: ids.length };
   }
 
@@ -324,7 +330,7 @@ export class TetherService {
       $set: { ownerUid: to._id, [`editors.${uid}`]: { canDelete: true } },
       $unset: { [`editors.${to._id}`]: '' },
     });
-    for (const a of await this.store.artifactsInRepo(repoId)) if (!a.parentFolderId) await this.touch(a, [uid]);
+    for (const a of await this.store.artifactsInRepo(repoId)) if (!a.parentFolderId) await this.touch(a, { also: [uid] });
     return this.repoView(await this.store.repoById(repoId));
   }
 
@@ -445,15 +451,24 @@ export class TetherService {
   }
 
   /**
-   * The tick's check with a change cursor: when the caller's feed has not moved since `cursor`
-   * (the value its last full check returned), nothing it holds changed, and the answer costs one
-   * read. Realtime items always take the full path (their leases are renewed by checks).
+   * The tick's check with a change cursor (the value the caller's last check returned). If the
+   * feed has not moved, nothing it holds changed: `{ unchanged }` after one read. If it moved, only
+   * items that changed since the cursor (or whose folder did; items carry `root` for that) are
+   * looked up: `results` has null for the others (`partial`). Without a usable cursor, or with
+   * realtime items (checks renew their leases), every item is checked.
    */
   async checkSince(uid, items, cursor) {
     if (!Array.isArray(items)) throw badRequest('items required');
-    const seq = await this.store.feedSeq(uid); // read before the data, so a later change bumps past it
-    if (cursor !== undefined && cursor !== null && Number(cursor) === seq && !items.some((i) => i.realtime)) return { unchanged: true, cursor: seq };
-    return { results: await this.check(uid, items), cursor: seq };
+    const feed = await this.store.feed(uid); // read before the data, so a later change bumps past it
+    const c = cursor === undefined || cursor === null ? null : Number(cursor);
+    const usable = c !== null && Number.isFinite(c) && c >= feed.floor && c <= feed.seq && !items.some((i) => i.realtime);
+    if (!usable) return { results: await this.check(uid, items), cursor: feed.seq };
+    if (c === feed.seq) return { unchanged: true, cursor: feed.seq };
+    const dirty = (i) => (feed.changed[i.artifactId] ?? 0) > c || (!!i.root && (feed.changed[i.root] ?? 0) > c);
+    const pick = items.filter(dirty);
+    const found = pick.length ? await this.check(uid, pick) : [];
+    let k = 0;
+    return { results: items.map((i) => (dirty(i) ? found[k++] : null)), partial: true, cursor: feed.seq };
   }
 
   /**
@@ -495,7 +510,7 @@ export class TetherService {
         if (!rt && a.realtime && a.realtime.uid !== uid) await this.store.releaseRealtime(a._id, a.realtime.uid);
         const session = { uid, email: user?.email ?? uid, since: rt?.since ?? now, expiresAt: now + this.realtimeTtlMs };
         if (await this.store.claimRealtime(a._id, uid, session, now)) {
-          if (!rt) await this.touch(root);
+          if (!rt) await this.touch(root, { ids: [a._id] });
           rt = session;
         }
       }
@@ -554,7 +569,7 @@ export class TetherService {
     if (a.parentFolderId && (set.relPath || set.deleted)) {
       await this.bumpFolder(a.parentFolderId, uid, { type: set.deleted ? 'delete' : 'move', childId: a._id, relPath: next.relPath });
     }
-    await this.touch(root);
+    await this.touch(root, { ids: [a._id, ...(a.parentFolderId && (set.relPath || set.deleted) ? [root._id] : [])] });
     return { version: baseVersion + 1, state: view({ ...next, currentVersion: baseVersion + 1 }) };
   }
 
@@ -576,7 +591,7 @@ export class TetherService {
     if (a.parentFolderId && (set.relPath !== a.relPath || set.deleted !== !!a.deleted)) {
       await this.bumpFolder(a.parentFolderId, uid, { type: set.deleted ? 'delete' : 'restore', childId: a._id, relPath: set.relPath });
     }
-    await this.touch(root);
+    await this.touch(root, { ids: [a._id, ...(a.parentFolderId ? [root._id] : [])] });
     return view({ ...a, ...set, currentVersion: version });
   }
 
@@ -654,7 +669,7 @@ export class TetherService {
     if (!Object.keys(update.$set).length) delete update.$set;
     const before = await this.audience(a);
     await this.store.updateArtifact(a._id, update);
-    await this.touch(await this.store.artifactById(a._id), before);
+    await this.touch(await this.store.artifactById(a._id), { also: before });
     return this.sharing(uid, artifactId);
   }
 

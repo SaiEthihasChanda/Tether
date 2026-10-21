@@ -1,10 +1,11 @@
 // Firestore storage adapter: same methods and semantics as MongoStore.
 // Collections: users, sessions, cliCodes, repos, artifacts, versions, grants, feeds.
 // Only the server (Admin SDK) touches Firestore; security rules deny all client access.
-import { Timestamp, FieldValue } from 'firebase-admin/firestore';
+import { Timestamp } from 'firebase-admin/firestore';
 
 const CHUNK = 30; // Firestore 'in' query limit
 const BATCH = 400;
+const FEED_MAX = 400; // artifacts remembered per feed document
 
 const duplicate = (msg) => Object.assign(new Error(msg), { code: 11000 });
 
@@ -285,15 +286,28 @@ export class FirestoreStore {
     return (await this.c('grants').where('artifactId', '==', artifactId).get()).docs.map((d) => d.get('uid'));
   }
 
-  // change feeds: one counter per user, bumped whenever something they may hold changes
-  async bumpFeeds(uids) {
-    for (const part of chunks(uids, BATCH)) {
-      const b = this.db.batch();
-      for (const uid of part) b.set(this.c('feeds').doc(uid), { seq: FieldValue.increment(1) }, { merge: true });
-      await b.commit();
-    }
+  // change feeds: per user, a counter and the counter value at which each artifact last changed.
+  // Clients listen to their own feed document (see firestore.rules). The oldest entries are
+  // dropped past FEED_MAX; `floor` says which cursors can no longer be answered from the map.
+  async bumpFeeds(uids, ids) {
+    await Promise.all(uids.map((uid) => this.db.runTransaction(async (tx) => {
+      const ref = this.c('feeds').doc(uid);
+      const cur = (await tx.get(ref)).data() ?? {};
+      const seq = (cur.seq ?? 0) + 1;
+      let changed = { ...(cur.changed ?? {}) };
+      for (const id of ids) changed[id] = seq;
+      let floor = cur.floor ?? 0;
+      const entries = Object.entries(changed);
+      if (entries.length > FEED_MAX) {
+        entries.sort((a, b) => b[1] - a[1]);
+        floor = Math.max(floor, entries[FEED_MAX][1]);
+        changed = Object.fromEntries(entries.slice(0, FEED_MAX));
+      }
+      tx.set(ref, { seq, floor, changed });
+    })));
   }
-  async feedSeq(uid) {
-    return (await this.c('feeds').doc(uid).get()).get('seq') ?? 0;
+  async feed(uid) {
+    const d = (await this.c('feeds').doc(uid).get()).data() ?? {};
+    return { seq: d.seq ?? 0, floor: d.floor ?? 0, changed: d.changed ?? {} };
   }
 }

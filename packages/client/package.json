@@ -1,6 +1,6 @@
 {
   "name": "@tether/client",
-  "version": "0.5.0",
+  "version": "0.6.0",
   "type": "module",
   "bin": {
     "tether": "bin/tether.js",
@@ -10,6 +10,7 @@
     "@tether/shared": "^0.1.0",
     "commander": "^14.0.1",
     "diff": "^8.0.2",
+    "firebase": "^12.19.0",
     "koffi": "^3.3.3"
   }
 }

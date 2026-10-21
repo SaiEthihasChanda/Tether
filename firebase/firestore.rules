@@ -1,8 +1,12 @@
 rules_version = '2';
-// Clients never read or write Firestore directly: every request goes through the API
-// (Cloud Function, Admin SDK), which enforces roles, versions and validation.
+// Clients never write Firestore and read only their own change feed (feeds/{uid}: a counter and
+// which artifact IDs changed, nothing else). Everything else goes through the API (Cloud Function,
+// Admin SDK), which enforces roles, versions and validation.
 service cloud.firestore {
   match /databases/{database}/documents {
+    match /feeds/{uid} {
+      allow read: if request.auth != null && request.auth.uid == uid;
+    }
     match /{document=**} {
       allow read, write: if false;
     }

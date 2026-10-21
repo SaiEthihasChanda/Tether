@@ -119,10 +119,23 @@ export class MongoStore {
   deleteGrantsOfUser(uid) { return this.grants.deleteMany({ uid }); }
   async grantsFor(artifactId) { return (await this.grants.find({ artifactId }).toArray()).map((g) => g.uid); }
 
-  // change feeds: one counter per user, bumped whenever something they may hold changes
-  async bumpFeeds(uids) {
+  // change feeds: per user, a counter and the counter value at which each artifact last changed
+  async bumpFeeds(uids, ids) {
     if (!uids.length) return;
-    await this.feeds.bulkWrite(uids.map((uid) => ({ updateOne: { filter: { _id: uid }, update: { $inc: { seq: 1 } }, upsert: true } })));
+    const stamp = Object.fromEntries(ids.map((id) => [id, '$seq']));
+    await this.feeds.bulkWrite(uids.map((uid) => ({
+      updateOne: {
+        filter: { _id: uid },
+        update: [
+          { $set: { seq: { $add: [{ $ifNull: ['$seq', 0] }, 1] }, floor: { $ifNull: ['$floor', 0] } } },
+          { $set: { changed: { $mergeObjects: [{ $ifNull: ['$changed', {}] }, stamp] } } },
+        ],
+        upsert: true,
+      },
+    })));
   }
-  async feedSeq(uid) { return (await this.feeds.findOne({ _id: uid }))?.seq ?? 0; }
+  async feed(uid) {
+    const f = await this.feeds.findOne({ _id: uid });
+    return { seq: f?.seq ?? 0, floor: f?.floor ?? 0, changed: f?.changed ?? {} };
+  }
 }

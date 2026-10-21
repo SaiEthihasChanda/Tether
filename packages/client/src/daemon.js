@@ -15,6 +15,7 @@ import { listen } from './ipc.js';
 import { VERSION } from './version.js';
 import { latestVersion, isNewer } from './update.js';
 import { Notifier } from './notifier.js';
+import { FeedListener } from './feed.js';
 import { fileURLToPath } from 'node:url';
 
 export { VERSION };
@@ -24,6 +25,9 @@ const REALTIME_TICK_SECONDS = 3; // check cadence while a live session is involv
 // or incoming change brings it straight back.
 const IDLE_AFTER_MS = 10 * 60 * 1000;
 const IDLE_MAX_SECONDS = 180;
+// With the push channel up, changes arrive as they happen: timer passes stay local and ask the
+// server only this often, as a safety net.
+const PUSH_TICK_SECONDS = 15 * 60;
 const UPDATE_CHECK_MS = 24 * 60 * 60 * 1000;
 
 export async function runDaemon() {
@@ -60,12 +64,24 @@ export async function runDaemon() {
   let stopping = false;
   let latest = null; // newest tether-sync on npm, checked daily
 
-  async function runTick(opts) {
+  let remoteAt = 0; // last time a pass asked the server
+
+  /**
+   * A pass: local work (follow moves, revert accidental edits) always; the server check unless the
+   * push channel is up, in which case it runs on a push, on commands, and every PUSH_TICK_SECONDS.
+   */
+  async function runTick({ remote } = {}) {
+    remote ??= !feed.live || engine.realtimeActive || Date.now() - remoteAt >= PUSH_TICK_SECONDS * 1000;
+    if (remote) remoteAt = Date.now();
     try {
-      await engine.locked(() => engine.tick(opts));
+      await engine.locked(() => engine.tick({ remote }));
     } catch (e) {
       log(`tick failed: ${e.stack || e.message}`);
       notifier.notify({ kind: 'error', level: 'error', key: 'tick-failed', cooldownMs: 3600 * 1000, title: 'Tether hit an error', body: `${e.message}. Run "tether log" for details.` });
+    }
+    if (engine.gitPassDue) {
+      engine.gitPassDue = false;
+      gitPassSoon(); // a git operation was caught midway: look again once it settles
     }
     refreshWatchers();
     scheduleGrace();
@@ -91,6 +107,17 @@ export async function runDaemon() {
     timerDue = Date.now() + seconds * 1000;
     timer = setTimeout(() => runTick(), seconds * 1000);
   }
+
+  // push: when the feed counter moves past what the last check saw, check now
+  const feed = new FeedListener({
+    api, log,
+    onChange: (seq) => {
+      if (stopping || engine.feed?.cursor === seq) return;
+      clearTimeout(timer);
+      timerDue = Date.now() + 300;
+      timer = setTimeout(() => runTick({ remote: true }), 300);
+    },
+  });
 
   /** Something happened here: back to the normal cadence if the timer had slowed down. */
   function markActive() {
@@ -232,7 +259,7 @@ export async function runDaemon() {
   }
 
   const L = (fn) => (params) => engine.locked(() => fn(params));
-  const soon = () => setTimeout(() => runTick(), 10);
+  const soon = () => setTimeout(() => runTick({ remote: true }), 10);
 
   const handlers = {
     ping: () => ({ pid: process.pid, version: VERSION, home, tracker: tracker.name, server: config.get('server') }),
@@ -244,12 +271,13 @@ export async function runDaemon() {
       };
     },
     sync: async () => {
-      await runTick();
+      await runTick({ remote: true });
       return { offline: engine.offline };
     },
     async 'login.password'({ email, password, signup }) {
       const user = await api.passwordLogin({ email, password, signup });
       engine.feed = null;
+      feed.restart();
       soon();
       return user;
     },
@@ -260,6 +288,7 @@ export async function runDaemon() {
       try {
         const user = await p;
         engine.feed = null;
+        feed.restart();
         soon();
         return user;
       } finally {
@@ -268,6 +297,7 @@ export async function runDaemon() {
     },
     logout: async () => {
       engine.feed = null;
+      feed.stop();
       return api.logout();
     },
     whoami: () => api.call('GET', '/me'),
@@ -329,7 +359,10 @@ export async function runDaemon() {
     'config.get': ({ key }) => (key ? { [key]: config.get(key) } : config.values),
     'config.set': ({ key, value }) => {
       config.set(key, value);
-      if (key === 'server') engine.feed = null; // a cursor belongs to one server
+      if (key === 'server') {
+        engine.feed = null; // a cursor belongs to one server
+        feed.restart();
+      }
       if (key === 'tickSeconds') schedule();
       return { [key]: config.get(key) };
     },
@@ -372,6 +405,7 @@ export async function runDaemon() {
     clearInterval(updateTimer);
     clearInterval(repoTimer);
     clearTimeout(gitTimer);
+    feed.stop();
     for (const w of watchers.values()) w.close();
     server.close();
     engine.locked(() => db.close()).finally(() => {
@@ -391,4 +425,5 @@ export async function runDaemon() {
   const updateTimer = setInterval(checkForUpdate, UPDATE_CHECK_MS);
   setTimeout(checkForUpdate, 5000);
   await runTick();
+  feed.start();
 }

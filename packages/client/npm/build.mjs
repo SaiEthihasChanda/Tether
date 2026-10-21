@@ -1,5 +1,5 @@
 // Builds the publishable CLI package (npm name: tether-sync) into dist/npm.
-// The internal @tether/shared module is bundled in; koffi, commander and diff stay dependencies.
+// The internal @tether/shared module is bundled in; koffi, commander, diff and firebase stay dependencies.
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -23,11 +23,11 @@ await build({
   format: 'esm',
   platform: 'node',
   target: 'node22',
-  external: ['koffi', 'commander', 'diff'],
+  external: ['koffi', 'commander', 'diff', 'firebase', 'firebase/*'],
   logLevel: 'warning',
 });
 
-const deps = Object.fromEntries(['koffi', 'commander', 'diff'].map((d) => [d, pkg.dependencies[d]]));
+const deps = Object.fromEntries(['koffi', 'commander', 'diff', 'firebase'].map((d) => [d, pkg.dependencies[d]]));
 fs.writeFileSync(path.join(out, 'package.json'), JSON.stringify({
   name: 'tether-sync',
   version: pkg.version,

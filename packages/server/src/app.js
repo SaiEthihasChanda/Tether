@@ -3,7 +3,7 @@
 import express from 'express';
 import fs from 'node:fs';
 import path from 'node:path';
-import { HttpError, badRequest } from './errors.js';
+import { HttpError, badRequest, notFound } from './errors.js';
 
 export function createApp({ service, auth, consoleDir, maxFileSize }) {
   const app = express();
@@ -43,6 +43,11 @@ export function createApp({ service, auth, consoleDir, maxFileSize }) {
   });
 
   api.post('/auth/cli-code', async (req, res) => res.json({ code: await auth.cliCode(req.uid) }));
+  // push: daemons listen to their own change feed document (Firebase backends only)
+  api.post('/feed/token', async (req, res) => {
+    if (!auth.feedToken) throw notFound('this server has no push channel; clients poll');
+    res.json({ uid: req.uid, ...(await auth.feedToken(req.uid)) });
+  });
   api.get('/me', async (req, res) => res.json(await service.me(req.uid)));
   api.delete('/me', async (req, res) => {
     await service.deleteAccount(req.uid);

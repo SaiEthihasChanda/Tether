@@ -14,7 +14,7 @@ import {
 export class UserError extends Error {}
 
 const ACTIVE = (i) => i.mode !== 'orphaned';
-const FULL_CHECK_MS = 5 * 60 * 1000; // a full check at least this often, even when the change cursor says nothing moved
+const FULL_CHECK_MS = 60 * 60 * 1000; // a full check at least this often, even when the change cursor says nothing moved
 
 export class Engine {
   constructor({ db, api, cache, tracker, config, log = () => {}, notify = () => {}, home = null, cliPath = null }) {
@@ -544,7 +544,10 @@ export class Engine {
     }
     let results, cursor;
     try {
-      const body = { items: insts.map((i) => ({ artifactId: i.artifactId, version: i.baseVersion })), cursor: this.reusableCursor(insts) };
+      // `root`: a file's folder, so a change to the folder (sharing, layout) re-checks its files too
+      const rootOf = (i) => (i.folderInstanceId ? this.db.get(i.folderInstanceId)?.artifactId : undefined);
+      const items = insts.map((i) => ({ artifactId: i.artifactId, version: i.baseVersion, root: rootOf(i) }));
+      const body = { items, cursor: this.reusableCursor(insts) };
       const res = await this.api.call('POST', '/sync/check', body);
       this.offline = null;
       if (res.unchanged) return; // nothing this user holds changed since the last full check
@@ -561,6 +564,7 @@ export class Engine {
     const folders = [];
     insts.forEach((inst, idx) => {
       const r = results[idx];
+      if (!r) return; // partial answer: unchanged since the cursor
       const cur = this.db.get(inst.instanceId);
       if (!cur || cur.mode === 'orphaned') return;
       if (r.status === 'gone') return this.orphan(cur, r.reason);
@@ -629,7 +633,7 @@ export class Engine {
     }
     // A folder with files still waiting for git stays behind, so they are offered again next pass.
     for (const f of folders) if (!waiting.has(f.inst.instanceId)) this.db.update(f.inst.instanceId, { baseVersion: f.state.version });
-    if (results.some((r) => r.status !== 'ok')) this.activityAt = Date.now();
+    if (results.some((r) => r && r.status !== 'ok')) this.activityAt = Date.now();
     this.rememberCursor(cursor);
   }
 
@@ -703,6 +707,23 @@ export class Engine {
     return local?.hash === inst.baseHash;
   }
 
+  /**
+   * Follow mode, just before a revert: is this content git's own (a git operation that started
+   * after this pass checked, e.g. a cherry-pick between writing the file and moving HEAD)? Asks git
+   * afresh, since the pass's busy check may be stale by now.
+   */
+  gitWroteIt(inst) {
+    if (inst.gitMode !== 'follow' || !inst.gitRoot) return false;
+    if (gitBusy(inst.gitDir)) return true;
+    const blob = fileBlob(inst.gitRoot, inst.path);
+    if (!blob) return false;
+    if (blob === indexBlob(inst.gitRoot, inst.path) || blob === blobAt(inst.gitRoot, 'HEAD', inst.path)) {
+      this.gitPassDue = true;
+      return true;
+    }
+    return false;
+  }
+
   /** Normal mode: restore missing files, put moved files back, revert local edits. */
   async enforceLocal() {
     const restores = this.db.all().filter((i) => ACTIVE(i) && i.needsRestore && i.mode === 'normal');
@@ -733,6 +754,7 @@ export class Engine {
           continue;
         }
         if (!this.cache.has(cur.baseHash)) continue; // offline and not cached yet
+        if (this.gitWroteIt(cur)) continue; // git's version: the git pass publishes it
         this.db.update(cur.instanceId, { ...this.writeInstance(cur, cur.path, cur.baseHash), lastError: null });
         this.log(`${cur.path}: local change reverted (use \`tether edit\` to change it)`);
         const byGit = cur.gitMode === 'keep';

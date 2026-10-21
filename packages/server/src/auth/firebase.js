@@ -73,6 +73,19 @@ export class FirebaseAuth {
     return { customToken: await this.adminAuth.createCustomToken(c.uid), user: { uid: c.uid, email: user?.email, displayName: user?.displayName } };
   }
 
+  /**
+   * What a daemon needs to listen to its own feed document with the Firebase SDK: a custom token
+   * and the project's public config (plus emulator hosts when running against them).
+   */
+  async feedToken(uid) {
+    const emulators = { auth: process.env.FIREBASE_AUTH_EMULATOR_HOST, firestore: process.env.FIRESTORE_EMULATOR_HOST };
+    return {
+      customToken: await this.adminAuth.createCustomToken(uid),
+      firebase: { apiKey: this.config.apiKey, projectId: this.config.projectId, authDomain: this.config.authDomain },
+      ...(emulators.auth || emulators.firestore ? { emulators } : {}),
+    };
+  }
+
   async deleteUser(uid) {
     await this.adminAuth.deleteUser(uid).catch((e) => {
       if (e.code !== 'auth/user-not-found') throw e;

@@ -82,7 +82,7 @@ export function createApp({ service, auth, consoleDir, maxFileSize }) {
   // artifacts
   api.post('/artifacts', async (req, res) => res.json(await service.manage(req.uid, req.body)));
   api.post('/pull', async (req, res) => res.json(await service.pull(req.uid, req.body.shareId, { peek: !!req.body.peek })));
-  api.post('/sync/check', async (req, res) => res.json({ results: await service.check(req.uid, req.body.items) }));
+  api.post('/sync/check', async (req, res) => res.json(await service.checkSince(req.uid, req.body.items, req.body.cursor)));
   api.get('/artifacts/:id', async (req, res) => res.json(await service.getArtifact(req.uid, req.params.id)));
   api.post('/artifacts/:id/children', async (req, res) => res.json(await service.addChild(req.uid, req.params.id, req.body)));
   api.post('/artifacts/:id/commit', async (req, res) => res.json(await service.commit(req.uid, req.params.id, req.body)));

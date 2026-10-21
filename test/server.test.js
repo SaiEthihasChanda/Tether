@@ -130,6 +130,54 @@ test('sync check reports changes, demotion, and rotation', async () => {
   assert.equal((await viewer.call('POST', '/pull', { shareId: s.shareId })).role, 'viewer');
 });
 
+test('change cursor: an unchanged check is cheap, every kind of change moves it', async () => {
+  const a = await manageFile('cursor.txt', 'one\n');
+  await viewer.call('POST', '/pull', { shareId: a.shareId });
+  const items = (v) => [{ artifactId: a.artifactId, version: v }];
+  const check = (u, v, cursor) => u.call('POST', '/sync/check', { items: items(v), cursor });
+
+  // a full check returns the cursor; asking again with it says "unchanged"
+  let r = await check(viewer, 1);
+  assert.equal(r.results[0].status, 'ok');
+  assert.equal(typeof r.cursor, 'number');
+  let c = r.cursor;
+  assert.deepEqual(await check(viewer, 1, c), { unchanged: true, cursor: c });
+
+  // a push by the owner moves every holder's cursor
+  await owner.call('POST', `/artifacts/${a.artifactId}/commit`, { baseVersion: 1, change: await owner.upload('two\n') });
+  r = await check(viewer, 1, c);
+  assert.equal(r.results[0].status, 'changed');
+  assert.ok(r.cursor > c);
+  c = r.cursor;
+  assert.equal((await check(viewer, 2, c)).unchanged, true);
+
+  // so do rollback, sharing changes and deletes
+  await owner.call('POST', `/artifacts/${a.artifactId}/rollback`, { toVersion: 1 });
+  r = await check(viewer, 2, c);
+  assert.equal(r.results[0].state.version, 3);
+  c = r.cursor;
+  await owner.call('POST', `/artifacts/${a.artifactId}/share`, { addEditor: 'viewer@example.com' });
+  r = await check(viewer, 3, c);
+  assert.equal(r.results[0].role, 'editor');
+  c = r.cursor;
+  await owner.call('POST', `/artifacts/${a.artifactId}/share`, { revoke: 'viewer@example.com' });
+  r = await check(viewer, 3, c);
+  assert.deepEqual([r.results[0].status, r.results[0].reason], ['gone', 'revoked']);
+
+  // a stranger's cursor does not move for changes they cannot see
+  const sc = (await stranger.call('POST', '/sync/check', { items: [] })).cursor;
+  await owner.call('POST', `/artifacts/${a.artifactId}/delete`);
+  assert.equal((await stranger.call('POST', '/sync/check', { items: [], cursor: sc })).unchanged, true);
+  const oc = (await owner.call('POST', '/sync/check', { items: items(4) })).cursor;
+  assert.equal((await owner.call('POST', '/sync/check', { items: items(4), cursor: oc })).unchanged, true);
+
+  // realtime items always get a full answer (the check renews their lease)
+  const b = await manageFile('cursor-live.txt', 'live\n');
+  const bc = (await owner.call('POST', '/sync/check', { items: [{ artifactId: b.artifactId, version: 1 }] })).cursor;
+  r = await owner.call('POST', '/sync/check', { items: [{ artifactId: b.artifactId, version: 1, realtime: true }], cursor: bc });
+  assert.ok(r.results);
+});
+
 test('allowlist visibility', async () => {
   const a = await manageFile('private.txt', 'p\n');
   await owner.call('POST', `/artifacts/${a.artifactId}/share`, { visibility: 'allowlist', allow: ['viewer@example.com'] });

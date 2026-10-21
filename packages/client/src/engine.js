@@ -14,6 +14,7 @@ import {
 export class UserError extends Error {}
 
 const ACTIVE = (i) => i.mode !== 'orphaned';
+const FULL_CHECK_MS = 5 * 60 * 1000; // a full check at least this often, even when the change cursor says nothing moved
 
 export class Engine {
   constructor({ db, api, cache, tracker, config, log = () => {}, notify = () => {}, home = null, cliPath = null }) {
@@ -509,6 +510,31 @@ export class Engine {
     this.notify({ kind: 'orphaned', level: 'warn', title: 'No longer synced', body: `${path.basename(inst.path)}: ${what}. Your copy stays on disk but Tether no longer keeps it up to date.`, short: path.basename(inst.path) });
   }
 
+  /** What a check asks about; a change cursor is only valid for the same question. */
+  checkKey(insts) {
+    return insts.map((i) => `${i.artifactId}@${i.baseVersion}:${i.mode}`).join(',');
+  }
+
+  /**
+   * The change cursor from the last full check, if it can be reused: same instances, nothing
+   * pending, no live sessions, and a full check at least every FULL_CHECK_MS as a safety net.
+   */
+  reusableCursor(insts) {
+    const f = this.feed;
+    if (!f || this.realtimeActive || Date.now() - f.at > FULL_CHECK_MS) return undefined;
+    return f.key === this.checkKey(insts) ? f.cursor : undefined;
+  }
+
+  /**
+   * Keeps the server's cursor only when nothing is pending here: an incoming version held back
+   * (editing, unmanaged, waiting for git) must be offered again by a full check once it can apply.
+   */
+  rememberCursor(cursor) {
+    const insts = this.db.all().filter(ACTIVE);
+    const settled = insts.every((i) => i.remoteVersion == null || i.remoteVersion === i.baseVersion);
+    this.feed = cursor !== undefined && settled ? { cursor, key: this.checkKey(insts), at: Date.now() } : null;
+  }
+
   /** One batched call for all instances (DESIGN §6.1 step 2). */
   async checkRemote() {
     const insts = this.db.all().filter(ACTIVE);
@@ -516,10 +542,13 @@ export class Engine {
       this.offline = null;
       return;
     }
-    let results;
+    let results, cursor;
     try {
-      ({ results } = await this.api.call('POST', '/sync/check', { items: insts.map((i) => ({ artifactId: i.artifactId, version: i.baseVersion })) }));
+      const body = { items: insts.map((i) => ({ artifactId: i.artifactId, version: i.baseVersion })), cursor: this.reusableCursor(insts) };
+      const res = await this.api.call('POST', '/sync/check', body);
       this.offline = null;
+      if (res.unchanged) return; // nothing this user holds changed since the last full check
+      ({ results, cursor } = res);
     } catch (e) {
       if (e instanceof OfflineError || (e instanceof ApiError && e.status === 401)) {
         this.offline = e.message;
@@ -600,6 +629,8 @@ export class Engine {
     }
     // A folder with files still waiting for git stays behind, so they are offered again next pass.
     for (const f of folders) if (!waiting.has(f.inst.instanceId)) this.db.update(f.inst.instanceId, { baseVersion: f.state.version });
+    if (results.some((r) => r.status !== 'ok')) this.activityAt = Date.now();
+    this.rememberCursor(cursor);
   }
 
   /** Normal mode: write an incoming version (content and/or layout). */

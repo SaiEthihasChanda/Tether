@@ -86,14 +86,16 @@ export class TetherService {
       const fresh = await this.store.artifactById(a._id);
       throw conflict(`being edited in realtime by ${fresh.realtime?.email}`, { realtime: this.realtimeView(fresh.realtime, uid) });
     }
+    if (cur?.uid !== uid) await this.touch(root);
     return { realtime: this.realtimeView(session, uid) };
   }
 
   /** Ends the caller's session. The owner may also end someone else's (force). */
   async stopRealtime(uid, artifactId, { force = false } = {}) {
-    const { role } = await this.access(uid, artifactId);
+    const { role, root } = await this.access(uid, artifactId);
     if (force && role !== 'owner') throw forbidden('only the owner can end someone else\'s realtime session');
     await this.store.releaseRealtime(artifactId, force ? null : uid);
+    await this.touch(root);
     return { ok: true };
   }
 
@@ -118,6 +120,26 @@ export class TetherService {
     const r = this.roleOf(uid, root, grant);
     if (!r.role) throw notFound('artifact not found or access revoked');
     return { artifact, root, ...r };
+  }
+
+  // ---- change feeds ----
+  // Each user has a counter that goes up whenever something they may hold a copy of changes.
+  // A client that saw counter N on its last full check, and still sees N, has nothing to fetch:
+  // its check costs one read instead of a few per file (see checkSince).
+
+  /** Everyone who may hold a copy of root: owner, editors, allowlist and link grants. */
+  async audience(root) {
+    return [root.ownerUid, ...Object.keys(root.editors ?? {}), ...(root.allowlist ?? []), ...(await this.store.grantsFor(root._id))];
+  }
+
+  /** Bumps the feeds of everyone who may hold root (plus `also`). Never fails the change itself. */
+  async touch(root, also = []) {
+    try {
+      const uids = [...new Set([...(root ? await this.audience(root) : []), ...also])].filter(Boolean);
+      await this.store.bumpFeeds(uids);
+    } catch (e) {
+      console.error('feed bump failed', e);
+    }
   }
 
   async requireOwner(uid, artifactId) {
@@ -280,9 +302,12 @@ export class TetherService {
   /** Hard purge of server data. Client instances become orphaned; local files are never touched. */
   async deleteRepo(uid, repoId) {
     await this.requireRepoOwner(uid, repoId);
-    const ids = (await this.store.artifactsInRepo(repoId)).map((a) => a._id);
+    const all = await this.store.artifactsInRepo(repoId);
+    const holders = (await Promise.all(all.filter((a) => !a.parentFolderId).map((a) => this.audience(a)))).flat();
+    const ids = all.map((a) => a._id);
     await this.purgeArtifacts(ids);
     await this.store.deleteRepo(repoId);
+    await this.touch(null, holders);
     return { purgedArtifacts: ids.length };
   }
 
@@ -299,6 +324,7 @@ export class TetherService {
       $set: { ownerUid: to._id, [`editors.${uid}`]: { canDelete: true } },
       $unset: { [`editors.${to._id}`]: '' },
     });
+    for (const a of await this.store.artifactsInRepo(repoId)) if (!a.parentFolderId) await this.touch(a, [uid]);
     return this.repoView(await this.store.repoById(repoId));
   }
 
@@ -387,6 +413,7 @@ export class TetherService {
     await this.store.insertArtifacts([child]);
     await this.store.insertVersion({ ...this.snapshot(child), artifactId: child._id, version: 1, type: 'create', authorUid: uid, createdAt: now, basedOn: 0 });
     await this.bumpFolder(folderId, uid, { type: 'add', childId: child._id, relPath });
+    await this.touch(folder);
     return view(child);
   }
 
@@ -415,6 +442,18 @@ export class TetherService {
     if (artifact.kind === 'folder') out.children = (await this.store.childrenOf(artifact._id)).map(view);
     if (artifact.parentFolderId) out.folder = view(root);
     return out;
+  }
+
+  /**
+   * The tick's check with a change cursor: when the caller's feed has not moved since `cursor`
+   * (the value its last full check returned), nothing it holds changed, and the answer costs one
+   * read. Realtime items always take the full path (their leases are renewed by checks).
+   */
+  async checkSince(uid, items, cursor) {
+    if (!Array.isArray(items)) throw badRequest('items required');
+    const seq = await this.store.feedSeq(uid); // read before the data, so a later change bumps past it
+    if (cursor !== undefined && cursor !== null && Number(cursor) === seq && !items.some((i) => i.realtime)) return { unchanged: true, cursor: seq };
+    return { results: await this.check(uid, items), cursor: seq };
   }
 
   /**
@@ -455,7 +494,10 @@ export class TetherService {
       if (realtime && role !== 'viewer' && (!rt || rt.uid === uid) && !a.deleted) {
         if (!rt && a.realtime && a.realtime.uid !== uid) await this.store.releaseRealtime(a._id, a.realtime.uid);
         const session = { uid, email: user?.email ?? uid, since: rt?.since ?? now, expiresAt: now + this.realtimeTtlMs };
-        if (await this.store.claimRealtime(a._id, uid, session, now)) rt = session;
+        if (await this.store.claimRealtime(a._id, uid, session, now)) {
+          if (!rt) await this.touch(root);
+          rt = session;
+        }
       }
       const out = { artifactId, role, canDelete, version: a.currentVersion, folderDeleted: !!(a.parentFolderId && root.deleted), realtime: this.realtimeView(rt, uid) };
       if (a.currentVersion === version) {
@@ -476,7 +518,7 @@ export class TetherService {
    * change: { blob, size } and/or { relPath } (files in folders) and/or { deleted: true }.
    */
   async commit(uid, artifactId, { baseVersion, change = {} }) {
-    const { artifact: a, role, canDelete } = await this.access(uid, artifactId);
+    const { artifact: a, root, role, canDelete } = await this.access(uid, artifactId);
     if (role === 'viewer') throw forbidden('viewers cannot push changes');
     if (change.deleted && !canDelete) throw forbidden('you do not have delete permission');
     if (a.deleted) throw conflict('artifact has been deleted', { current: view(a) });
@@ -512,12 +554,13 @@ export class TetherService {
     if (a.parentFolderId && (set.relPath || set.deleted)) {
       await this.bumpFolder(a.parentFolderId, uid, { type: set.deleted ? 'delete' : 'move', childId: a._id, relPath: next.relPath });
     }
+    await this.touch(root);
     return { version: baseVersion + 1, state: view({ ...next, currentVersion: baseVersion + 1 }) };
   }
 
   /** Forward-only rollback (owner): a new version copies an old version's state. Also restores deletes. */
   async rollback(uid, artifactId, toVersion) {
-    const { artifact: a } = await this.requireOwner(uid, artifactId);
+    const { artifact: a, root } = await this.requireOwner(uid, artifactId);
     if (a.kind !== 'file') throw badRequest('roll back individual files inside a folder');
     const v = await this.store.version(a._id, Number(toVersion));
     if (!v) throw notFound(`version ${toVersion} not found`);
@@ -533,6 +576,7 @@ export class TetherService {
     if (a.parentFolderId && (set.relPath !== a.relPath || set.deleted !== !!a.deleted)) {
       await this.bumpFolder(a.parentFolderId, uid, { type: set.deleted ? 'delete' : 'restore', childId: a._id, relPath: set.relPath });
     }
+    await this.touch(root);
     return view({ ...a, ...set, currentVersion: version });
   }
 
@@ -544,6 +588,7 @@ export class TetherService {
     if (a.kind === 'folder') {
       await this.store.casArtifact(a._id, a.currentVersion, { deleted: true });
       await this.store.insertVersion({ artifactId: a._id, version: a.currentVersion + 1, type: 'delete', deleted: true, authorUid: uid, createdAt: new Date(), basedOn: a.currentVersion });
+      await this.touch(a);
       return view({ ...a, deleted: true, currentVersion: a.currentVersion + 1 });
     }
     return (await this.commit(uid, artifactId, { baseVersion: a.currentVersion, change: { deleted: true } })).state;
@@ -555,6 +600,7 @@ export class TetherService {
     if (a.kind !== 'folder' || !a.deleted) throw badRequest('not a deleted folder');
     await this.store.casArtifact(a._id, a.currentVersion, { deleted: false });
     await this.store.insertVersion({ artifactId: a._id, version: a.currentVersion + 1, type: 'restore', deleted: false, authorUid: uid, createdAt: new Date(), basedOn: a.currentVersion });
+    await this.touch(a);
     return view({ ...a, deleted: false, currentVersion: a.currentVersion + 1 });
   }
 
@@ -606,7 +652,9 @@ export class TetherService {
     } else throw badRequest('unknown share operation');
     if (!Object.keys(update.$unset).length) delete update.$unset;
     if (!Object.keys(update.$set).length) delete update.$set;
+    const before = await this.audience(a);
     await this.store.updateArtifact(a._id, update);
+    await this.touch(await this.store.artifactById(a._id), before);
     return this.sharing(uid, artifactId);
   }
 

@@ -21,6 +21,7 @@ export class MongoStore {
     this.artifacts = db.collection('artifacts');
     this.versions = db.collection('versions');
     this.grants = db.collection('grants');
+    this.feeds = db.collection('feeds');
   }
 
   async init() {
@@ -116,4 +117,12 @@ export class MongoStore {
   grantsOf(uid, artifactIds) { return this.grants.find({ uid, artifactId: { $in: artifactIds } }).toArray(); }
   deleteGrantsFor(ids) { return this.grants.deleteMany({ artifactId: { $in: ids } }); }
   deleteGrantsOfUser(uid) { return this.grants.deleteMany({ uid }); }
+  async grantsFor(artifactId) { return (await this.grants.find({ artifactId }).toArray()).map((g) => g.uid); }
+
+  // change feeds: one counter per user, bumped whenever something they may hold changes
+  async bumpFeeds(uids) {
+    if (!uids.length) return;
+    await this.feeds.bulkWrite(uids.map((uid) => ({ updateOne: { filter: { _id: uid }, update: { $inc: { seq: 1 } }, upsert: true } })));
+  }
+  async feedSeq(uid) { return (await this.feeds.findOne({ _id: uid }))?.seq ?? 0; }
 }

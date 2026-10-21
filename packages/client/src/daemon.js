@@ -5,7 +5,7 @@ import path from 'node:path';
 import http from 'node:http';
 import crypto from 'node:crypto';
 import { tetherHome, ipcEndpoint, files } from './paths.js';
-import { Config } from './config.js';
+import { Config, MIN_TICK_SECONDS } from './config.js';
 import { LocalDb } from './db.js';
 import { Credentials } from './credentials.js';
 import { Api, BlobCache, ApiError } from './api.js';
@@ -19,6 +19,11 @@ import { fileURLToPath } from 'node:url';
 
 export { VERSION };
 const REALTIME_TICK_SECONDS = 3; // check cadence while a live session is involved
+// When nothing has happened for a while the timer slows down: the configured interval for the first
+// IDLE_AFTER_MS, then doubling every IDLE_AFTER_MS up to IDLE_MAX_SECONDS. Any local change, command
+// or incoming change brings it straight back.
+const IDLE_AFTER_MS = 10 * 60 * 1000;
+const IDLE_MAX_SECONDS = 180;
 const UPDATE_CHECK_MS = 24 * 60 * 60 * 1000;
 
 export async function runDaemon() {
@@ -67,11 +72,30 @@ export async function runDaemon() {
     schedule(); // the cadence depends on what this pass saw (realtime sessions)
   }
 
+  let activeAt = Date.now(); // last local change or command
+  let timerDue = 0;
+
+  /** Seconds until the next check: fast during live sessions, slower the longer nothing happens. */
+  function interval() {
+    const base = Math.max(MIN_TICK_SECONDS, config.get('tickSeconds'));
+    if (engine.realtimeActive) return Math.min(base, REALTIME_TICK_SECONDS);
+    const idle = Date.now() - Math.max(activeAt, engine.activityAt ?? 0);
+    if (idle < IDLE_AFTER_MS) return base;
+    return Math.max(base, Math.min(IDLE_MAX_SECONDS, base * 2 ** Math.floor(idle / IDLE_AFTER_MS)));
+  }
+
   function schedule() {
     clearTimeout(timer);
     if (stopping) return;
-    const seconds = engine.realtimeActive ? Math.min(config.get('tickSeconds'), REALTIME_TICK_SECONDS) : config.get('tickSeconds');
+    const seconds = interval();
+    timerDue = Date.now() + seconds * 1000;
     timer = setTimeout(() => runTick(), seconds * 1000);
+  }
+
+  /** Something happened here: back to the normal cadence if the timer had slowed down. */
+  function markActive() {
+    activeAt = Date.now();
+    if (timer && timerDue - activeAt > interval() * 1000) schedule();
   }
 
   /** Pushes live edits about a second after the last change (debounced). */
@@ -160,6 +184,7 @@ export async function runDaemon() {
         const w = kind === 'git'
           ? fs.watch(dir, { persistent: false }, () => gitPassSoon())
           : fs.watch(dir, { recursive: kind, persistent: false }, () => {
+            markActive();
             quickPass(250);
             realtimePass();
           });
@@ -224,6 +249,7 @@ export async function runDaemon() {
     },
     async 'login.password'({ email, password, signup }) {
       const user = await api.passwordLogin({ email, password, signup });
+      engine.feed = null;
       soon();
       return user;
     },
@@ -233,13 +259,17 @@ export async function runDaemon() {
       if (!p) throw new UserError('no login in progress');
       try {
         const user = await p;
+        engine.feed = null;
         soon();
         return user;
       } finally {
         logins.delete(state);
       }
     },
-    logout: async () => api.logout(),
+    logout: async () => {
+      engine.feed = null;
+      return api.logout();
+    },
     whoami: () => api.call('GET', '/me'),
     manage: L((p) => engine.manage(p)),
     add: L((p) => engine.add(p)),
@@ -299,6 +329,7 @@ export async function runDaemon() {
     'config.get': ({ key }) => (key ? { [key]: config.get(key) } : config.values),
     'config.set': ({ key, value }) => {
       config.set(key, value);
+      if (key === 'server') engine.feed = null; // a cursor belongs to one server
       if (key === 'tickSeconds') schedule();
       return { [key]: config.get(key) };
     },
@@ -315,6 +346,7 @@ export async function runDaemon() {
   async function handle(method, params) {
     const h = handlers[method];
     if (!h) throw new UserError(`unknown command ${method}`);
+    if (method !== 'ping') markActive();
     try {
       const result = await h(params);
       if (CHANGES_WATCHED.has(method)) refreshWatchers();

@@ -17,7 +17,7 @@ export class Machine {
     this.home = fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), `tether-${name}-home-`)));
     this.dir = fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), `tether-${name}-work-`)));
     // Notifications go to a file in tests instead of popping up on the desktop.
-    this.env = { ...process.env, TETHER_HOME: this.home, TETHER_SERVER: serverUrl, TETHER_NOTIFY_LOG: path.join(this.home, 'notify.log') };
+    this.env = { ...process.env, TETHER_HOME: this.home, TETHER_SERVER: serverUrl, TETHER_NOTIFY_LOG: path.join(this.home, 'notify.log'), TETHER_MIN_TICK_SECONDS: '1' };
     if (tracker) this.env.TETHER_TRACKER = tracker;
     fs.writeFileSync(path.join(this.home, 'config.json'), JSON.stringify({ server: serverUrl, tickSeconds, graceMs, scanRoots: [this.dir] }));
   }

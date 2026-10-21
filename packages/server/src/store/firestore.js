@@ -1,7 +1,7 @@
 // Firestore storage adapter: same methods and semantics as MongoStore.
-// Collections: users, sessions, cliCodes, repos, artifacts, versions, grants.
+// Collections: users, sessions, cliCodes, repos, artifacts, versions, grants, feeds.
 // Only the server (Admin SDK) touches Firestore; security rules deny all client access.
-import { Timestamp } from 'firebase-admin/firestore';
+import { Timestamp, FieldValue } from 'firebase-admin/firestore';
 
 const CHUNK = 30; // Firestore 'in' query limit
 const BATCH = 400;
@@ -280,5 +280,20 @@ export class FirestoreStore {
   }
   deleteGrantsOfUser(uid) {
     return this.deleteWhere('grants', 'uid', '==', uid);
+  }
+  async grantsFor(artifactId) {
+    return (await this.c('grants').where('artifactId', '==', artifactId).get()).docs.map((d) => d.get('uid'));
+  }
+
+  // change feeds: one counter per user, bumped whenever something they may hold changes
+  async bumpFeeds(uids) {
+    for (const part of chunks(uids, BATCH)) {
+      const b = this.db.batch();
+      for (const uid of part) b.set(this.c('feeds').doc(uid), { seq: FieldValue.increment(1) }, { merge: true });
+      await b.commit();
+    }
+  }
+  async feedSeq(uid) {
+    return (await this.c('feeds').doc(uid).get()).get('seq') ?? 0;
   }
 }

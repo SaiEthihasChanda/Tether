@@ -12,6 +12,9 @@ export const DEFAULTS = {
 
 const NUMERIC = new Set(['tickSeconds', 'graceMs']);
 
+/** The shortest check interval allowed: each check is a server request (tests lower it with the env var). */
+export const MIN_TICK_SECONDS = Number(process.env.TETHER_MIN_TICK_SECONDS) || 10;
+
 export class Config {
   constructor(file) {
     this.file = file;
@@ -33,6 +36,7 @@ export class Config {
     if (NUMERIC.has(key)) {
       value = Number(value);
       if (!Number.isFinite(value) || value <= 0) throw new Error(`${key} must be a positive number`);
+      if (key === 'tickSeconds' && value < MIN_TICK_SECONDS) throw new Error(`tickSeconds must be at least ${MIN_TICK_SECONDS}`);
     }
     if (key === 'notifications' && !['all', 'errors', 'off'].includes(value)) throw new Error('notifications must be all, errors or off');
     if (key === 'scanRoots' && typeof value === 'string') value = value.split(/[;,]/).map((s) => s.trim()).filter(Boolean);

@@ -32,7 +32,7 @@ nsis:
   createDesktopShortcut: true
   createStartMenuShortcut: true
   shortcutName: Tether
-  artifactName: Tether-Setup-${version}.exe
+  artifactName: Tether-Setup.exe
   include: build/installer.nsh
 publish:
   provider: github

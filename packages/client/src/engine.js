@@ -560,7 +560,7 @@ export class Engine {
    * never paths. Sent when that changes (or the device name does), and once a day as a heartbeat.
    */
   async reportInstances({ force = false } = {}) {
-    if (this.reportUnsupported) return;
+    if (Date.now() < (this.reportRetryAt ?? 0)) return; // the server did not know reports; ask again later
     const instances = this.db.all().filter((i) => ACTIVE(i) && !i.folderInstanceId)
       .map((i) => ({ instanceId: i.instanceId, artifactId: i.artifactId, mode: i.mode, version: i.baseVersion }));
     const deviceName = this.deviceName();
@@ -571,7 +571,7 @@ export class Engine {
     try {
       await this.api.call('POST', '/instances/report', { deviceId: this.deviceId(), deviceName, platform: process.platform, instances, ack });
     } catch (e) {
-      if (e instanceof ApiError && e.status === 404) this.reportUnsupported = true; // an older server
+      if (e instanceof ApiError && e.status === 404) this.reportRetryAt = Date.now() + 60 * 60 * 1000; // an older server: retry in an hour (it may be updated)
       if (e instanceof ApiError || e instanceof OfflineError) return;
       throw e;
     }

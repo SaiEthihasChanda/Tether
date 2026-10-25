@@ -118,6 +118,7 @@ export function errorText(e) {
   if (/no artifact with that share ID/i.test(m)) return "That share code doesn't work. Check it, or ask the owner for a new one.";
   if (/already a managed copy/i.test(m)) return 'There is already a synced copy at that place.';
   if (/already exists with different content/i.test(m)) return 'A different file with that name is already there. Choose another place.';
+  if (/^no route /i.test(m) || e?.status === 404 && /route/i.test(m)) return 'This needs a newer Tether server. It will work once the server is updated.';
   if (/offline|ENOTFOUND|ECONNREFUSED|fetch failed/i.test(m)) return 'Tether cannot reach the internet right now. Try again when you are back online.';
   return m.replace(/`tether ([a-z]+)[^`]*`/g, (_, c) => `"${{ edit: 'Make changes', done: 'Done', track: 'Sync again', unmanage: 'Stop syncing' }[c] ?? c}"`);
 }

@@ -2,6 +2,8 @@
 // one batched call, then apply incoming versions and revert local drift in normal mode.
 import fs from 'node:fs';
 import path from 'node:path';
+import os from 'node:os';
+import crypto from 'node:crypto';
 import { createTwoFilesPatch } from 'diff';
 import { canonicalize, sha256, resolveEol, newInstanceId, nameError, relPathError, caseCollisionError, isBinary } from '@tether/shared';
 import { ApiError, OfflineError, describeTransfer } from './api.js';
@@ -14,6 +16,7 @@ import {
 export class UserError extends Error {}
 
 const ACTIVE = (i) => i.mode !== 'orphaned';
+const REPORT_EVERY_MS = 24 * 60 * 60 * 1000; // copies are reported on change, and at least this often
 const FULL_CHECK_MS = 60 * 60 * 1000; // a full check at least this often, even when the change cursor says nothing moved
 
 export class Engine {
@@ -109,6 +112,7 @@ export class Engine {
     if (remote) {
       await this.checkRemote();
       await this.syncRealtime();
+      await this.reportInstances();
     }
     await this.enforceLocal();
     this.lastTick = Date.now();
@@ -535,6 +539,68 @@ export class Engine {
     this.feed = cursor !== undefined && settled ? { cursor, key: this.checkKey(insts), at: Date.now() } : null;
   }
 
+  // ---------- usage reporting (the owner's view of who holds copies) ----------
+
+  /** This device's stable ID (created once) and the name owners see. */
+  deviceId() {
+    let id = this.db.getMeta('deviceId');
+    if (!id) {
+      id = 'd_' + crypto.randomUUID().replace(/-/g, '');
+      this.db.setMeta('deviceId', id);
+    }
+    return id;
+  }
+
+  deviceName() {
+    return this.config.get('deviceName') || os.hostname();
+  }
+
+  /**
+   * Tells the server which shared files and folders this device holds: state and version only,
+   * never paths. Sent when that changes (or the device name does), and once a day as a heartbeat.
+   */
+  async reportInstances({ force = false } = {}) {
+    if (this.reportUnsupported) return;
+    const instances = this.db.all().filter((i) => ACTIVE(i) && !i.folderInstanceId)
+      .map((i) => ({ instanceId: i.instanceId, artifactId: i.artifactId, mode: i.mode, version: i.baseVersion }));
+    const deviceName = this.deviceName();
+    const key = JSON.stringify([deviceName, instances]);
+    const last = this.db.getMeta('report') ?? {};
+    const ack = [...(this.unmanageAcks ?? [])];
+    if (!force && !ack.length && last.key === key && Date.now() - (last.at ?? 0) < REPORT_EVERY_MS) return;
+    try {
+      await this.api.call('POST', '/instances/report', { deviceId: this.deviceId(), deviceName, platform: process.platform, instances, ack });
+    } catch (e) {
+      if (e instanceof ApiError && e.status === 404) this.reportUnsupported = true; // an older server
+      if (e instanceof ApiError || e instanceof OfflineError) return;
+      throw e;
+    }
+    this.unmanageAcks = (this.unmanageAcks ?? []).filter((id) => !ack.includes(id));
+    this.db.setMeta('report', { key, at: Date.now() });
+  }
+
+  /** The owner stopped syncing these copies: unmanage them (files kept), tell the user, confirm. */
+  async applyOwnerUnmanage(instanceIds) {
+    for (const id of instanceIds) {
+      const inst = this.db.get(id);
+      if (inst && ACTIVE(inst) && inst.mode !== 'unmanaged') {
+        try {
+          await this.unmanage({ path: inst.path });
+          const name = path.basename(inst.path);
+          this.log(`${inst.path}: the owner stopped syncing it on this device; file kept (\`tether track\` syncs it again)`);
+          this.notify({
+            kind: 'unmanaged-by-owner', level: 'warn', short: name, artifactId: inst.artifactId,
+            title: 'The owner stopped syncing a file',
+            body: `${name} is no longer kept in sync on this device. Your copy stays as it is. Run "tether track ${name}" to sync it again.`,
+          });
+        } catch (e) {
+          if (!(e instanceof UserError)) throw e;
+        }
+      }
+    }
+    this.unmanageAcks = [...new Set([...(this.unmanageAcks ?? []), ...instanceIds])];
+  }
+
   /** One batched call for all instances (DESIGN §6.1 step 2). */
   async checkRemote() {
     const insts = this.db.all().filter(ACTIVE);
@@ -550,6 +616,7 @@ export class Engine {
       const body = { items, cursor: this.reusableCursor(insts) };
       const res = await this.api.call('POST', '/sync/check', body);
       this.offline = null;
+      if (res.unmanage?.length) await this.applyOwnerUnmanage(res.unmanage);
       if (res.unchanged) return; // nothing this user holds changed since the last full check
       ({ results, cursor } = res);
     } catch (e) {

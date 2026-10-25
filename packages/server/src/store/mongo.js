@@ -22,6 +22,7 @@ export class MongoStore {
     this.versions = db.collection('versions');
     this.grants = db.collection('grants');
     this.feeds = db.collection('feeds');
+    this.instances = db.collection('instances');
   }
 
   async init() {
@@ -34,6 +35,8 @@ export class MongoStore {
     await this.artifacts.createIndex({ parentFolderId: 1 });
     await this.versions.createIndex({ artifactId: 1, version: 1 }, { unique: true });
     await this.grants.createIndex({ artifactId: 1, uid: 1 }, { unique: true });
+    await this.instances.createIndex({ rootId: 1 });
+    await this.instances.createIndex({ uid: 1, deviceId: 1 });
   }
 
   close() {
@@ -136,6 +139,30 @@ export class MongoStore {
   }
   async feed(uid) {
     const f = await this.feeds.findOne({ _id: uid });
-    return { seq: f?.seq ?? 0, floor: f?.floor ?? 0, changed: f?.changed ?? {} };
+    return { seq: f?.seq ?? 0, floor: f?.floor ?? 0, changed: f?.changed ?? {}, unmanage: f?.unmanage ?? {} };
   }
+  /** Owner asked to stop syncing these instances; the holder's daemon reads them from its feed. */
+  async requestUnmanage(uid, instanceIds) {
+    if (!instanceIds.length) return;
+    const now = Date.now();
+    await this.feeds.updateOne({ _id: uid }, { $set: Object.fromEntries(instanceIds.map((id) => [`unmanage.${id}`, now])) }, { upsert: true });
+  }
+  async ackUnmanage(uid, instanceIds) {
+    if (!instanceIds.length) return;
+    await this.feeds.updateOne({ _id: uid }, { $unset: Object.fromEntries(instanceIds.map((id) => [`unmanage.${id}`, ''])) });
+  }
+
+  // instances: copies daemons hold of root artifacts (reported, for the owner's usage view)
+  async replaceDeviceInstances(uid, deviceId, docs) {
+    if (docs.length) {
+      await this.instances.bulkWrite(docs.map(({ _id, ...d }) => ({ replaceOne: { filter: { _id }, replacement: d, upsert: true } })));
+    }
+    await this.instances.deleteMany({ uid, deviceId, _id: { $nin: docs.map((d) => d._id) } });
+  }
+  instancesOfRoot(rootId) { return this.instances.find({ rootId }).toArray(); }
+  async markInstances(ids, set) {
+    if (ids.length) await this.instances.updateMany({ _id: { $in: ids } }, { $set: set });
+  }
+  deleteInstancesFor(rootIds) { return this.instances.deleteMany({ rootId: { $in: rootIds } }); }
+  deleteInstancesOfUser(uid) { return this.instances.deleteMany({ uid }); }
 }

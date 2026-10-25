@@ -129,6 +129,19 @@ test('repository, file preview, sharing, and history', { skip }, async () => {
   await page.getByRole('button', { name: 'Rotate' }).click();
   await page.waitForFunction((old) => document.querySelector('[data-testid="share-id"]')?.textContent.trim() !== old, shareId);
 
+  // usage: the owner's daemon and the friend's device report copies; stop syncing the friend's
+  await cli.sync();
+  const guideId = (await friend.call('POST', '/pull', { shareId: (await page.getByTestId('share-id').textContent()).trim() })).artifact.artifactId;
+  await friend.call('POST', '/instances/report', { deviceId: 'd_friend', deviceName: 'FRIEND-PC', platform: 'linux', instances: [{ instanceId: 'i_friend', artifactId: guideId, mode: 'normal', version: 3 }] });
+  await page.getByRole('link', { name: 'Usage' }).click();
+  await page.getByTestId('usage-summary').getByText('2 copies').waitFor();
+  const friendDevice = page.getByRole('listitem', { name: 'friend@example.com on FRIEND-PC' });
+  await friendDevice.getByText('Linux').waitFor();
+  await shot(page, 'usage');
+  await friendDevice.getByRole('button', { name: 'Stop syncing here' }).click();
+  await friendDevice.getByText('stopping…').waitFor();
+  assert.deepEqual((await friend.call('POST', '/sync/check', { items: [] })).unmanage, ['i_friend']);
+
   if (shots) {
     await page.setViewportSize({ width: 390, height: 844 });
     await page.getByRole('link', { name: 'Code' }).click();

@@ -4,6 +4,9 @@ import path from 'node:path';
 import { newArtifactId, newRepoId, newShareId, nameError, relPathError, caseCollisionError, EOL_MODES, sha256, CHUNK_MAX } from '@tether/shared';
 
 const HASH = /^[0-9a-f]{64}$/;
+const ID = /^[A-Za-z0-9_-]{1,64}$/;
+const MODES = ['normal', 'editing', 'unmanaged'];
+const STALE_MS = 30 * 24 * 60 * 60 * 1000; // a device not seen for this long is shown as inactive
 const FETCH_LIMIT = 8 * 1024 * 1024; // bytes per chunk fetch response
 
 /** Runs fn over items with limited concurrency. */
@@ -312,6 +315,7 @@ export class TetherService {
     const holders = (await Promise.all(roots.map((a) => this.audience(a)))).flat();
     const ids = all.map((a) => a._id);
     await this.purgeArtifacts(ids);
+    await this.store.deleteInstancesFor(roots.map((a) => a._id));
     await this.store.deleteRepo(repoId);
     await this.touch(null, { also: holders, ids: roots.map((a) => a._id) });
     return { purgedArtifacts: ids.length };
@@ -462,13 +466,14 @@ export class TetherService {
     const feed = await this.store.feed(uid); // read before the data, so a later change bumps past it
     const c = cursor === undefined || cursor === null ? null : Number(cursor);
     const usable = c !== null && Number.isFinite(c) && c >= feed.floor && c <= feed.seq && !items.some((i) => i.realtime);
-    if (!usable) return { results: await this.check(uid, items), cursor: feed.seq };
-    if (c === feed.seq) return { unchanged: true, cursor: feed.seq };
+    const extra = Object.keys(feed.unmanage).length ? { unmanage: Object.keys(feed.unmanage) } : {};
+    if (!usable) return { results: await this.check(uid, items), cursor: feed.seq, ...extra };
+    if (c === feed.seq) return { unchanged: true, cursor: feed.seq, ...extra };
     const dirty = (i) => (feed.changed[i.artifactId] ?? 0) > c || (!!i.root && (feed.changed[i.root] ?? 0) > c);
     const pick = items.filter(dirty);
     const found = pick.length ? await this.check(uid, pick) : [];
     let k = 0;
-    return { results: items.map((i) => (dirty(i) ? found[k++] : null)), partial: true, cursor: feed.seq };
+    return { results: items.map((i) => (dirty(i) ? found[k++] : null)), partial: true, cursor: feed.seq, ...extra };
   }
 
   /**
@@ -792,6 +797,90 @@ export class TetherService {
     return out;
   }
 
+  // ---- usage: which accounts and devices hold copies (DESIGN: owner's view) ----
+
+  /**
+   * A daemon reports the copies it holds of root artifacts (files and folders it pulled or
+   * manages): replace semantics per device. No paths, only state. Copies of artifacts the caller
+   * cannot access are ignored. `ack` confirms unmanage requests it has applied.
+   */
+  async reportInstances(uid, { deviceId, deviceName, platform, instances, ack } = {}) {
+    if (!ID.test(String(deviceId))) throw badRequest('invalid device id');
+    if (!Array.isArray(instances) || instances.length > 5000) throw badRequest('instances required');
+    const name = String(deviceName ?? '').trim().slice(0, 100) || 'Unnamed device';
+    const plat = String(platform ?? '').slice(0, 20);
+    for (const i of instances) {
+      if (!ID.test(String(i.instanceId)) || !ID.test(String(i.artifactId))) throw badRequest('invalid instance');
+      if (!MODES.includes(i.mode)) throw badRequest('invalid mode');
+    }
+    const ids = [...new Set(instances.map((i) => i.artifactId))];
+    const arts = new Map((await this.store.artifactsByIds(ids)).map((a) => [a._id, a]));
+    const grants = new Map((await this.store.grantsOf(uid, ids)).map((g) => [g.artifactId, g]));
+    const now = new Date();
+    const docs = instances
+      .filter((i) => {
+        const a = arts.get(i.artifactId);
+        return a && !a.parentFolderId && this.roleOf(uid, a, grants.get(a._id)).role;
+      })
+      .map((i) => ({
+        _id: i.instanceId, uid, deviceId, deviceName: name, platform: plat, rootId: i.artifactId,
+        kind: arts.get(i.artifactId).kind, mode: i.mode, version: Number.isInteger(i.version) ? i.version : null, seenAt: now,
+      }));
+    await this.store.replaceDeviceInstances(uid, deviceId, docs);
+    if (Array.isArray(ack) && ack.length) await this.store.ackUnmanage(uid, ack.filter((x) => ID.test(String(x))));
+    return { stored: docs.length };
+  }
+
+  /** Owner: who holds copies of this artifact, grouped by account and device. */
+  async usage(uid, artifactId) {
+    const { root } = await this.requireOwner(uid, artifactId);
+    const list = await this.store.instancesOfRoot(root._id);
+    const uids = [...new Set(list.map((i) => i.uid))];
+    const users = new Map((await this.store.usersByIds(uids)).map((u) => [u._id, u]));
+    const now = Date.now();
+    const accounts = new Map();
+    for (const i of list) {
+      if (!accounts.has(i.uid)) {
+        const role = i.uid === root.ownerUid ? 'owner' : root.editors?.[i.uid] ? 'editor' : 'viewer';
+        accounts.set(i.uid, { uid: i.uid, email: users.get(i.uid)?.email ?? '(deleted account)', role, you: i.uid === uid, devices: new Map() });
+      }
+      const acc = accounts.get(i.uid);
+      if (!acc.devices.has(i.deviceId)) acc.devices.set(i.deviceId, { deviceId: i.deviceId, name: i.deviceName, platform: i.platform, seenAt: i.seenAt, copies: [] });
+      const dev = acc.devices.get(i.deviceId);
+      const seen = new Date(i.seenAt).getTime();
+      if (seen > new Date(dev.seenAt).getTime()) dev.seenAt = i.seenAt;
+      dev.copies.push({ instanceId: i._id, mode: i.mode, version: i.version, pending: !!i.unmanagePending && i.mode !== 'unmanaged' });
+    }
+    const out = [...accounts.values()].map((a) => ({
+      ...a,
+      devices: [...a.devices.values()].map((d) => ({ ...d, active: now - new Date(d.seenAt).getTime() < STALE_MS })),
+    }));
+    out.sort((a, b) => (b.you - a.you) || a.email.localeCompare(b.email));
+    const devices = out.reduce((n, a) => n + a.devices.length, 0);
+    return { version: root.currentVersion, copies: list.length, devices, accounts: out };
+  }
+
+  /**
+   * Owner: stop syncing copies for someone, without revoking access. Target `instanceIds`
+   * (one device's copies) or `uid` (all of that person's copies). Their daemon gets the request
+   * through its feed, marks the copies unmanaged (files kept) and confirms with its next report.
+   */
+  async unmanageFor(uid, artifactId, { instanceIds, uid: target } = {}) {
+    const { root } = await this.requireOwner(uid, artifactId);
+    const want = Array.isArray(instanceIds) ? new Set(instanceIds) : null;
+    if (!want && !target) throw badRequest('instanceIds or uid required');
+    const list = await this.store.instancesOfRoot(root._id);
+    const hits = list.filter((i) => (want ? want.has(i._id) : i.uid === target) && i.mode !== 'unmanaged');
+    const byUser = new Map();
+    for (const i of hits) byUser.set(i.uid, [...(byUser.get(i.uid) ?? []), i._id]);
+    for (const [u, ids] of byUser) {
+      await this.store.requestUnmanage(u, ids);
+      await this.store.markInstances(ids, { unmanagePending: true });
+      await this.store.bumpFeeds([u], [root._id]); // the daemon checks now (push) and finds the request
+    }
+    return { requested: hits.length };
+  }
+
   // ---- account ----
 
   async me(uid) {
@@ -807,6 +896,7 @@ export class TetherService {
       await this.store.updateArtifact(a._id, { $unset: { [`editors.${uid}`]: '' }, $pull: { allowlist: uid } });
     }
     await this.store.deleteGrantsOfUser(uid);
+    await this.store.deleteInstancesOfUser(uid);
     await this.store.deleteSessionsOf(uid);
     await this.store.deleteUser(uid);
   }

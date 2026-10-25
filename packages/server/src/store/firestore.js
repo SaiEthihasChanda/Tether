@@ -1,7 +1,7 @@
 // Firestore storage adapter: same methods and semantics as MongoStore.
-// Collections: users, sessions, cliCodes, repos, artifacts, versions, grants, feeds.
+// Collections: users, sessions, cliCodes, repos, artifacts, versions, grants, feeds, instances.
 // Only the server (Admin SDK) touches Firestore; security rules deny all client access.
-import { Timestamp } from 'firebase-admin/firestore';
+import { Timestamp, FieldValue, FieldPath } from 'firebase-admin/firestore';
 
 const CHUNK = 30; // Firestore 'in' query limit
 const BATCH = 400;
@@ -303,11 +303,53 @@ export class FirestoreStore {
         floor = Math.max(floor, entries[FEED_MAX][1]);
         changed = Object.fromEntries(entries.slice(0, FEED_MAX));
       }
-      tx.set(ref, { seq, floor, changed });
+      tx.set(ref, { seq, floor, changed }, { mergeFields: ['seq', 'floor', 'changed'] }); // keep `unmanage`
     })));
   }
   async feed(uid) {
     const d = (await this.c('feeds').doc(uid).get()).data() ?? {};
-    return { seq: d.seq ?? 0, floor: d.floor ?? 0, changed: d.changed ?? {} };
+    return { seq: d.seq ?? 0, floor: d.floor ?? 0, changed: d.changed ?? {}, unmanage: d.unmanage ?? {} };
+  }
+  /** Owner asked to stop syncing these instances; the holder's daemon reads them from its feed. */
+  async requestUnmanage(uid, instanceIds) {
+    if (!instanceIds.length) return;
+    const now = Date.now();
+    await this.c('feeds').doc(uid).set({ unmanage: Object.fromEntries(instanceIds.map((id) => [id, now])) }, { merge: true });
+  }
+  async ackUnmanage(uid, instanceIds) {
+    if (!instanceIds.length) return;
+    const ref = this.c('feeds').doc(uid);
+    const snap = await ref.get();
+    if (!snap.exists) return;
+    const [first, ...rest] = instanceIds.flatMap((id) => [new FieldPath('unmanage', id), FieldValue.delete()]);
+    await ref.update(first, ...rest);
+  }
+
+  // instances: copies daemons hold of root artifacts (reported, for the owner's usage view)
+  async replaceDeviceInstances(uid, deviceId, docs) {
+    const keep = new Set(docs.map((d) => d._id));
+    const stale = (await this.c('instances').where('uid', '==', uid).where('deviceId', '==', deviceId).get()).docs.filter((d) => !keep.has(d.id));
+    const ops = [...docs.map((d) => (b) => b.set(this.c('instances').doc(d._id), toDoc(d))), ...stale.map((d) => (b) => b.delete(d.ref))];
+    for (const part of chunks(ops, BATCH)) {
+      const b = this.db.batch();
+      for (const op of part) op(b);
+      await b.commit();
+    }
+  }
+  instancesOfRoot(rootId) {
+    return this.all(this.c('instances').where('rootId', '==', rootId));
+  }
+  async markInstances(ids, set) {
+    for (const part of chunks(ids, BATCH)) {
+      const b = this.db.batch();
+      for (const id of part) b.set(this.c('instances').doc(id), set, { merge: true });
+      await b.commit();
+    }
+  }
+  async deleteInstancesFor(rootIds) {
+    for (const id of rootIds) await this.deleteWhere('instances', 'rootId', '==', id);
+  }
+  deleteInstancesOfUser(uid) {
+    return this.deleteWhere('instances', 'uid', '==', uid);
   }
 }

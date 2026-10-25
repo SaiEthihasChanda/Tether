@@ -426,7 +426,7 @@ export async function main(argv) {
   program.command('log').description('recent daemon activity').option('-n <lines>', 'lines', '30').action(async (o) => {
     for (const l of await daemon('log', { lines: Number(o.n) })) out(l);
   });
-  const cfg = program.command('config').description('client settings: server, consoleUrl, tickSeconds, graceMs, scanRoots');
+  const cfg = program.command('config').description('client settings: server, consoleUrl, tickSeconds, graceMs, scanRoots, notifications, deviceName');
   cfg.command('get [key]').action(async (key) => json(await daemon('config.get', { key })));
   cfg.command('set <key> <value>').action(async (key, value) => json(await daemon('config.set', { key, value })));
 

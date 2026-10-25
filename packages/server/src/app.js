@@ -43,6 +43,10 @@ export function createApp({ service, auth, consoleDir, maxFileSize }) {
   });
 
   api.post('/auth/cli-code', async (req, res) => res.json({ code: await auth.cliCode(req.uid) }));
+  // usage: daemons report the copies they hold; owners see them and can stop syncing them
+  api.post('/instances/report', async (req, res) => res.json(await service.reportInstances(req.uid, req.body)));
+  api.get('/artifacts/:id/usage', async (req, res) => res.json(await service.usage(req.uid, req.params.id)));
+  api.post('/artifacts/:id/unmanage', async (req, res) => res.json(await service.unmanageFor(req.uid, req.params.id, req.body)));
   // push: daemons listen to their own change feed document (Firebase backends only)
   api.post('/feed/token', async (req, res) => {
     if (!auth.feedToken) throw notFound('this server has no push channel; clients poll');

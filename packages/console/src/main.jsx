@@ -582,6 +582,82 @@ function Sharing({ id }) {
   );
 }
 
+const MODE_LABEL = { normal: ['in sync', 'success'], editing: ['editing', 'accent'], unmanaged: ['unmanaged', 'default'] };
+const PLATFORM = { win32: 'Windows', linux: 'Linux', darwin: 'macOS' };
+
+/** Owner: which accounts and devices hold copies, with "stop syncing" per device or per person. */
+function Usage({ id }) {
+  const u = useLoad(() => A.api('GET', `/artifacts/${id}/usage`), [id]);
+  const stop = (body) => A.api('POST', `/artifacts/${id}/unmanage`, body).then(u.reload);
+  if (u.error) return <ErrorFlash error={u.error} />;
+  if (!u.data) return <p className="muted">Loading…</p>;
+  const d = u.data;
+  const plural = (n, one, many = `${one}s`) => `${n} ${n === 1 ? one : many}`;
+  return (
+    <div className="settings">
+      <p className="usage-summary" data-testid="usage-summary">
+        <strong>{plural(d.copies, 'copy', 'copies')}</strong> on <strong>{plural(d.devices, 'device')}</strong> across <strong>{plural(d.accounts.length, 'account')}</strong>
+      </p>
+      <p className="muted small">Each device reports what it holds when that changes, and at least once a day. File locations on other people's computers are never shared. Stopping sync is not a revoke: the person keeps access and their file, and can sync again with <code>tether track</code>. To cut access, use Sharing.</p>
+      {!d.accounts.length ? (
+        <Box><Blankslate icon="people" title="No copies reported yet">
+          <p>Devices running Tether 0.7 or newer report their copies here. Older versions keep syncing but do not show up.</p>
+        </Blankslate></Box>
+      ) : d.accounts.map((a) => {
+        const live = a.devices.flatMap((dev) => dev.copies).filter((c) => c.mode !== 'unmanaged' && !c.pending);
+        return (
+          <Box
+            key={a.uid}
+            className="usage-account"
+            header={
+              <div className="usage-head" aria-label={a.email}>
+                <Avatar email={a.email} size={28} />
+                <span className="person"><strong>{a.you ? 'You' : handle(a.email)}</strong><span className="muted small">{a.email}</span></span>
+                <Label tone={a.role === 'owner' ? 'success' : a.role === 'editor' ? 'accent' : 'default'}>{a.role}</Label>
+                <span className="spacer" />
+                {!a.you && live.length > 0 && (
+                  <Action className="btn btn-sm btn-danger-quiet" label="Stop syncing for this person"
+                    confirm={`Stop syncing on all of ${a.email}'s devices? Their files stay as they are and they keep access; they can sync again with "tether track".`}
+                    onRun={() => stop({ uid: a.uid })} />
+                )}
+              </div>
+            }
+          >
+            <ul className="rows">
+              {a.devices.map((dev) => {
+                const devLive = dev.copies.filter((c) => c.mode !== 'unmanaged' && !c.pending);
+                return (
+                  <li key={dev.deviceId} className="row usage-device" aria-label={`${a.email} on ${dev.name}`}>
+                    <Icon name="device" className="icon-muted" />
+                    <span className="person">
+                      <strong>{dev.name}</strong>
+                      <span className="muted small">{PLATFORM[dev.platform] ?? dev.platform} · last seen {timeAgo(dev.seenAt)}{!dev.active && ' · inactive'}</span>
+                    </span>
+                    <span className="usage-copies">
+                      {dev.copies.length > 1 && <span className="muted small">{dev.copies.length} copies</span>}
+                      {dev.copies.map((c) => {
+                        const [text, tone] = c.pending ? ['stopping…', 'attention'] : MODE_LABEL[c.mode] ?? [c.mode, 'default'];
+                        const behind = c.mode === 'normal' && c.version != null && c.version < d.version;
+                        return <Label key={c.instanceId} tone={behind ? 'attention' : tone} title={c.version != null ? `has v${c.version}` : undefined}>{behind ? `v${c.version} (behind)` : text}</Label>;
+                      })}
+                    </span>
+                    <span className="spacer" />
+                    {!a.you && devLive.length > 0 && (
+                      <Action className="btn btn-sm" label="Stop syncing here"
+                        confirm={`Stop syncing on ${dev.name}? The file stays on that device as it is, and ${a.email} keeps access.`}
+                        onRun={() => stop({ instanceIds: devLive.map((c) => c.instanceId) })} />
+                    )}
+                  </li>
+                );
+              })}
+            </ul>
+          </Box>
+        );
+      })}
+    </div>
+  );
+}
+
 function ArtifactSettings({ id, x, role, canDelete, realtime, reload }) {
   const isOwner = role === 'owner';
   return (
@@ -623,7 +699,7 @@ function Artifact({ id, tab, query, user }) {
   const repo = repos.data?.find((r) => r.repoId === x.repoId);
   const base = `/artifacts/${id}`;
   const showSharing = isOwner && !x.parentFolderId;
-  const t = tab === 'sharing' && !showSharing ? 'code' : tab;
+  const t = (tab === 'sharing' || tab === 'usage') && !showSharing ? 'code' : tab;
 
   return (
     <>
@@ -653,6 +729,7 @@ function Artifact({ id, tab, query, user }) {
         items={[
           { key: 'code', to: base, icon: 'code', label: x.kind === 'folder' ? 'Files' : 'Code' },
           { key: 'history', to: `${base}/history`, icon: 'history', label: 'History', count: x.version },
+          showSharing && { key: 'usage', to: `${base}/usage`, icon: 'device', label: 'Usage' },
           showSharing && { key: 'sharing', to: `${base}/sharing`, icon: 'people', label: 'Sharing' },
           { key: 'settings', to: `${base}/settings`, icon: 'gear', label: 'Settings' },
         ]}
@@ -661,6 +738,7 @@ function Artifact({ id, tab, query, user }) {
         <div className="main-col">
           {t === 'history' && <History id={id} kind={x.kind} isOwner={isOwner} current={x.version} onChange={a.reload} />}
           {t === 'sharing' && <Sharing id={id} />}
+          {t === 'usage' && <Usage id={id} />}
           {t === 'settings' && <ArtifactSettings id={id} x={x} role={role} canDelete={canDelete} realtime={realtime} reload={a.reload} />}
           {t === 'code' && x.kind === 'folder' && <FolderView id={id} folder={x} files={children} dir={query.get('path') ?? ''} />}
           {t === 'code' && x.kind === 'file' && !x.deleted && <FileView id={id} artifact={x} version={query.get('version')} isOwner={isOwner} onRestored={() => { a.reload(); go(base); }} />}
@@ -775,7 +853,7 @@ function App() {
   if (path === '/cli-login') page = <CliLogin user={user} />;
   else if (path === '/new') page = <NewRepo user={user} />;
   else if ((m = path.match(/^\/repos\/([\w-]+)(?:\/(settings))?$/))) page = <Repo id={m[1]} tab={m[2] ?? 'artifacts'} user={user} />;
-  else if ((m = path.match(/^\/artifacts\/([\w-]+)(?:\/(history|sharing|settings))?$/))) page = <Artifact id={m[1]} tab={m[2] ?? 'code'} query={query} user={user} />;
+  else if ((m = path.match(/^\/artifacts\/([\w-]+)(?:\/(history|usage|sharing|settings))?$/))) page = <Artifact id={m[1]} tab={m[2] ?? 'code'} query={query} user={user} />;
   else if (path === '/account') page = <Account user={user} onSignOut={signOut} />;
   else page = <Dashboard user={user} />;
   return (

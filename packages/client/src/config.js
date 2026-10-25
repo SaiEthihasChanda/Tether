@@ -8,6 +8,7 @@ export const DEFAULTS = {
   graceMs: 2000,
   scanRoots: [os.homedir()],
   notifications: 'all', // all | errors | off
+  deviceName: '', // shown to owners of files this device holds; empty: the computer's name
 };
 
 const NUMERIC = new Set(['tickSeconds', 'graceMs']);
@@ -27,11 +28,17 @@ export class Config {
     if (process.env.TETHER_SERVER) this.values.server = process.env.TETHER_SERVER;
   }
 
+  /** Config keys are matched without regard to case (`devicename` is `deviceName`). */
+  static key(key) {
+    return Object.keys(DEFAULTS).find((k) => k.toLowerCase() === String(key).toLowerCase()) ?? key;
+  }
+
   get(key) {
-    return this.values[key];
+    return this.values[Config.key(key)];
   }
 
   set(key, value) {
+    key = Config.key(key);
     if (!(key in DEFAULTS)) throw new Error(`unknown config key "${key}" (known: ${Object.keys(DEFAULTS).join(', ')})`);
     if (NUMERIC.has(key)) {
       value = Number(value);
@@ -39,6 +46,7 @@ export class Config {
       if (key === 'tickSeconds' && value < MIN_TICK_SECONDS) throw new Error(`tickSeconds must be at least ${MIN_TICK_SECONDS}`);
     }
     if (key === 'notifications' && !['all', 'errors', 'off'].includes(value)) throw new Error('notifications must be all, errors or off');
+    if (key === 'deviceName') value = String(value).trim().slice(0, 100);
     if (key === 'scanRoots' && typeof value === 'string') value = value.split(/[;,]/).map((s) => s.trim()).filter(Boolean);
     this.values[key] = value;
     fs.writeFileSync(this.file, JSON.stringify(this.values, null, 2));

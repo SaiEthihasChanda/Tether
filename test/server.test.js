@@ -194,6 +194,52 @@ test('change cursor: an unchanged check is cheap, every kind of change moves it'
   assert.ok(r.results);
 });
 
+test('usage: devices report copies, the owner sees them and can stop syncing them', async () => {
+  const a = await manageFile('usage.txt', 'u\n');
+  await viewer.call('POST', '/pull', { shareId: a.shareId });
+  const report = (u, deviceId, deviceName, instances, ack) => u.call('POST', '/instances/report', { deviceId, deviceName, platform: 'win32', instances, ack });
+  await report(owner, 'd_owner', 'OWNER-PC', [{ instanceId: 'i_own1', artifactId: a.artifactId, mode: 'normal', version: 1 }]);
+  await report(viewer, 'd_v1', 'VIEWER-LAPTOP', [{ instanceId: 'i_v1a', artifactId: a.artifactId, mode: 'normal', version: 1 }, { instanceId: 'i_v1b', artifactId: a.artifactId, mode: 'editing', version: 1 }]);
+  await report(viewer, 'd_v2', 'Work desktop', [{ instanceId: 'i_v2', artifactId: a.artifactId, mode: 'normal', version: 1 }]);
+  // a copy of something you cannot access is ignored (no fake entries in someone's usage view)
+  const other = await manageFile('private.txt', 'p\n');
+  assert.equal((await report(stranger, 'd_s', 'X', [{ instanceId: 'i_s', artifactId: other.artifactId, mode: 'normal', version: 1 }])).stored, 0);
+  await rejects(report(viewer, 'bad id!', 'X', []), 400);
+
+  let u = await owner.call('GET', `/artifacts/${a.artifactId}/usage`);
+  assert.deepEqual([u.copies, u.devices, u.accounts.length], [4, 3, 2]);
+  assert.equal(u.accounts[0].you, true);
+  const v = u.accounts.find((x) => x.email === 'viewer@example.com');
+  assert.deepEqual(v.devices.map((d) => d.name).sort(), ['VIEWER-LAPTOP', 'Work desktop']);
+  assert.ok(!JSON.stringify(u).includes('path'), 'no paths in the usage view');
+  await rejects(viewer.call('GET', `/artifacts/${a.artifactId}/usage`), 403); // owners only
+  await rejects(stranger.call('GET', `/artifacts/${a.artifactId}/usage`), 404);
+
+  // stop syncing on one device: the request reaches that user's next check, even an "unchanged" one
+  const cur = (await viewer.call('POST', '/sync/check', { items: [{ artifactId: a.artifactId, version: 1 }] })).cursor;
+  assert.equal((await owner.call('POST', `/artifacts/${a.artifactId}/unmanage`, { instanceIds: ['i_v1a', 'i_v1b'] })).requested, 2);
+  let r = await viewer.call('POST', '/sync/check', { items: [{ artifactId: a.artifactId, version: 1 }], cursor: cur });
+  assert.deepEqual(r.unmanage.sort(), ['i_v1a', 'i_v1b']);
+  u = await owner.call('GET', `/artifacts/${a.artifactId}/usage`);
+  assert.ok(u.accounts.find((x) => x.email === 'viewer@example.com').devices.find((d) => d.name === 'VIEWER-LAPTOP').copies.every((c) => c.pending));
+  // the daemon applies it and confirms; access is untouched
+  await report(viewer, 'd_v1', 'VIEWER-LAPTOP', [{ instanceId: 'i_v1a', artifactId: a.artifactId, mode: 'unmanaged', version: 1 }, { instanceId: 'i_v1b', artifactId: a.artifactId, mode: 'unmanaged', version: 1 }], ['i_v1a', 'i_v1b']);
+  r = await viewer.call('POST', '/sync/check', { items: [{ artifactId: a.artifactId, version: 1 }] });
+  assert.equal(r.unmanage, undefined);
+  assert.equal(r.results[0].role, 'viewer');
+  u = await owner.call('GET', `/artifacts/${a.artifactId}/usage`);
+  const laptop = u.accounts.find((x) => x.email === 'viewer@example.com').devices.find((d) => d.name === 'VIEWER-LAPTOP');
+  assert.deepEqual(laptop.copies.map((c) => [c.mode, c.pending]), [['unmanaged', false], ['unmanaged', false]]);
+  // stop syncing for a person: all their remaining copies
+  assert.equal((await owner.call('POST', `/artifacts/${a.artifactId}/unmanage`, { uid: v.uid })).requested, 1);
+  assert.deepEqual((await viewer.call('POST', '/sync/check', { items: [] })).unmanage, ['i_v2']);
+  await rejects(owner.call('POST', `/artifacts/${a.artifactId}/unmanage`, {}), 400);
+  // a device's report replaces its list: a copy it no longer holds disappears
+  await report(viewer, 'd_v2', 'Work desktop', [], ['i_v2']);
+  u = await owner.call('GET', `/artifacts/${a.artifactId}/usage`);
+  assert.equal(u.devices, 2);
+});
+
 test('allowlist visibility', async () => {
   const a = await manageFile('private.txt', 'p\n');
   await owner.call('POST', `/artifacts/${a.artifactId}/share`, { visibility: 'allowlist', allow: ['viewer@example.com'] });

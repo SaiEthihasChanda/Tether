@@ -364,6 +364,7 @@ export async function runDaemon() {
         feed.restart();
       }
       if (key === 'tickSeconds') schedule();
+      if (Config.key(key) === 'deviceName') engine.locked(() => engine.reportInstances()).catch(() => {}); // owners see the new name now
       return { [key]: config.get(key) };
     },
     log: ({ lines = 50 }) => recent.slice(-lines),

@@ -340,6 +340,22 @@ export async function runDaemon() {
     async info({ ref }) {
       return api.call('GET', `/artifacts/${await engine.resolveArtifact(ref)}`);
     },
+    // owner views and actions used by the desktop app (and the web console through the API)
+    async usage({ ref }) {
+      return api.call('GET', `/artifacts/${await engine.resolveArtifact(ref)}/usage`);
+    },
+    async unmanageFor({ ref, instanceIds, uid }) {
+      return api.call('POST', `/artifacts/${await engine.resolveArtifact(ref)}/unmanage`, { instanceIds, uid });
+    },
+    async restoreFolder({ ref }) {
+      const r = await api.call('POST', `/artifacts/${await engine.resolveArtifact(ref)}/restore`);
+      soon();
+      return r;
+    },
+    async endRealtime({ ref }) {
+      return api.call('POST', `/artifacts/${await engine.resolveArtifact(ref)}/realtime`, { action: 'stop', force: true });
+    },
+    shared: () => api.call('GET', '/shared'),
     'repo.create': ({ name }) => api.call('POST', '/repos', { name }),
     'repo.list': () => api.call('GET', '/repos'),
     'repo.show': async ({ ref }) => api.call('GET', `/repos/${(await engine.findRepo(ref)).repoId}`),
@@ -348,6 +364,7 @@ export async function runDaemon() {
       soon();
       return r;
     },
+    'repo.rename': async ({ ref, name }) => api.call('PATCH', `/repos/${(await engine.findRepo(ref)).repoId}`, { name }),
     'repo.transfer': async ({ ref, to }) => api.call('POST', `/repos/${(await engine.findRepo(ref)).repoId}/transfer`, { to }),
     'repo.eol': async ({ ref, glob, mode }) => {
       const repo = await engine.findRepo(ref);

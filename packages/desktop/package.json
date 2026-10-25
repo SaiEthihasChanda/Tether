@@ -1,0 +1,27 @@
+{
+  "name": "@tether/desktop",
+  "version": "0.7.0",
+  "private": true,
+  "description": "Tether for Windows: the desktop app (tray, window, Explorer menu) around the Tether daemon.",
+  "type": "module",
+  "main": "main/main.js",
+  "devDependencies": {
+    "@vitejs/plugin-react": "5.0.4",
+    "electron": "44.7.0",
+    "electron-builder": "26.17.0",
+    "vite": "7.1.7",
+    "electron-updater": "6.8.10",
+    "react": "19.2.7",
+    "react-dom": "19.2.7"
+  },
+  "scripts": {
+    "icons": "node scripts/icons.mjs",
+    "build:renderer": "vite build",
+    "dev": "vite build && electron .",
+    "start": "electron .",
+    "build:main": "node scripts/build.mjs --dir",
+    "dist": "node scripts/build.mjs",
+    "release": "node scripts/build.mjs --publish"
+  },
+  "author": "Sai Ethihas Chanda"
+}

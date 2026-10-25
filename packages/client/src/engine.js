@@ -1369,6 +1369,13 @@ export class Engine {
       return {
         instanceId: i.instanceId, artifactId: i.artifactId, kind: i.kind, path: i.path, relPath: i.relPath, mode: i.mode, role: i.role,
         version: i.baseVersion, folderInstanceId: i.folderInstanceId, flags,
+        // the same facts as fields, for the desktop app
+        name: i.name ?? path.basename(i.path), repoId: i.repoId, canDelete: !!i.canDelete,
+        remoteVersion: i.remoteVersion ?? null, modified: flags.includes('modified'), locked: flags.includes('locked'),
+        detached: !!i.detached, missing: !!i.missingSince, restoring: !!i.needsRestore, lastError: i.lastError ?? null,
+        orphanReason: i.orphanReason ?? null, realtime: !!(i.realtime && i.mode === 'editing'),
+        liveBy: i.remoteRealtime && i.mode !== 'orphaned' ? JSON.parse(i.remoteRealtime) : null,
+        gitRoot: i.gitRoot ?? null, gitMode: i.gitMode ?? null, gitWaiting: !!i.gitWaiting, gitOverlay: !!i.gitOverlay,
       };
     });
   }

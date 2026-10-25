@@ -1,0 +1,41 @@
+# Tether for Windows installer. Per-user install (no admin rights), updates from GitHub Releases.
+appId: com.tether.desktop
+productName: Tether
+copyright: Copyright © 2026 Sai Ethihas Chanda
+directories:
+  output: dist-app
+  buildResources: build
+extraMetadata:
+  main: main-dist/main.cjs
+files:
+  - main-dist/**
+  - renderer/dist/**
+  - assets/**
+  - package.json
+  - "!node_modules"
+extraResources:
+  - from: build/runtime/tether
+    to: tether
+asar: true
+afterPack: build/afterPack.cjs
+npmRebuild: false
+win:
+  target:
+    - target: nsis
+      arch: [x64]
+  icon: build/icon.ico
+nsis:
+  oneClick: true
+  perMachine: false
+  allowElevation: false
+  deleteAppDataOnUninstall: false
+  createDesktopShortcut: true
+  createStartMenuShortcut: true
+  shortcutName: Tether
+  artifactName: Tether-Setup-${version}.exe
+  include: build/installer.nsh
+publish:
+  provider: github
+  owner: SaiEthihasChanda
+  repo: Tether
+  releaseType: release
